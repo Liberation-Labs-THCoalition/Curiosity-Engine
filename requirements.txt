@@ -1,0 +1,4 @@
+requests>=2.28.0
+# Optional dependencies (install for full features):
+# psycopg2-binary>=2.9.0     # PostgreSQL memory storage
+# sentence-transformers>=2.2.0  # Semantic novelty detection
