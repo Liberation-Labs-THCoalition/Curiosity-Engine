@@ -17,7 +17,7 @@ Version: 2.0.0
 License: MIT
 """
 
-import json, os, sys, time, uuid, logging, re, hashlib, subprocess, sqlite3, fcntl, difflib
+import json, os, sys, time, uuid, logging, re, hashlib, subprocess, sqlite3, fcntl, difflib, random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -70,6 +70,7 @@ class Config:
     ITEMS_PER_RUN = int(os.environ.get("CURIOSITY_ITEMS_PER_RUN", "1"))
     STUCK_AFTER_S = 6 * 3600  # an in_progress item older than this died with its run
     MAX_ATTEMPTS = 2
+    S2_API_KEY_FILE = os.environ.get("S2_API_KEY_FILE", "")  # a file holding the key; S2_API_KEY wins if both are set
 
     @classmethod
     def use_ollama(cls):
@@ -270,18 +271,41 @@ def search_arxiv(query: str, max_results: int = 10) -> List[Dict]:
         log.warning(f"arXiv search failed: {e}")
         return []
 
+def _s2_key() -> str:
+    key = os.environ.get("S2_API_KEY", "")
+    if not key and Config.S2_API_KEY_FILE:
+        try:
+            with open(Config.S2_API_KEY_FILE, encoding="utf-8") as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+    return key
+
+
 def search_s2(query: str, max_results: int = 10) -> List[Dict]:
-    """Search Semantic Scholar API with retry on rate limit."""
+    """Search Semantic Scholar, with an API key when one is configured (x-api-key; introductory limit 1 request/s).
+
+    A 429 backs off exponentially, honouring Retry-After, then gives up after the third attempt. The anonymous pool is
+    shared by everyone and refused every call on 2026-10-05; the old fixed 10/20/30 s waits cost a minute per topic."""
+    key = _s2_key()
+    headers = {"x-api-key": key} if key else {}
     for attempt in range(3):
         try:
             resp = requests.get(f"{Config.S2_API}/paper/search", params={
                 "query": query,
                 "limit": max_results,
                 "fields": "title,authors,year,abstract,citationCount,url"
-            }, timeout=Config.REQUEST_TIMEOUT)
+            }, headers=headers, timeout=Config.REQUEST_TIMEOUT)
             if resp.status_code == 429:
-                wait = (attempt + 1) * 10
-                log.info(f"  S2 rate limited, waiting {wait}s (attempt {attempt+1}/3)")
+                if attempt == 2:
+                    log.warning("  S2 rate limited on 3 attempts; skipping it for this topic")
+                    return []
+                try:
+                    wait = float(resp.headers.get("Retry-After") or 0)
+                except ValueError:
+                    wait = 0
+                wait = min(wait or 2 ** (attempt + 1), 60) + random.uniform(0, 1)
+                log.info(f"  S2 rate limited, waiting {wait:.1f}s (attempt {attempt+1}/3)")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -301,7 +325,7 @@ def search_s2(query: str, max_results: int = 10) -> List[Dict]:
             return papers
         except Exception as e:
             if attempt == 2:
-                log.warning(f"S2 search failed after retries: {e}")
+                log.warning(f"S2 search failed after retries: {type(e).__name__}")
             continue
     return []
 

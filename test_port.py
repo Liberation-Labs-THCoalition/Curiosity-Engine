@@ -117,6 +117,40 @@ def test_no_summary_without_external_papers():
         [u() for u in undo]
 
 
+def test_s2_sends_the_key_and_backs_off_exponentially():
+    with open(f'{TMP}/s2key', 'w') as f:
+        f.write('test-key-123\n')
+    seen, sleeps = [], []
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code, self.headers = code, {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {'data': [{'title': 'T', 'authors': [{'name': 'A'}], 'year': 2025, 'abstract': 'x', 'url': 'u',
+                              'citationCount': 3}]}
+    codes = iter([429, 429, 200])
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.append(headers)
+        return Resp(next(codes))
+    undo = [patch(ce.requests, 'get', fake_get), patch(ce.time, 'sleep', sleeps.append)]
+    old = ce.Config.S2_API_KEY_FILE
+    try:
+        ce.Config.S2_API_KEY_FILE = f'{TMP}/s2key'
+        out = ce.search_s2('q')
+        assert [h.get('x-api-key') for h in seen] == ['test-key-123'] * 3, seen
+        assert 2 <= sleeps[0] < 3 and 4 <= sleeps[1] < 5, sleeps          # exponential, with jitter under a second
+        assert out and out[0]['title'] == 'T'
+        ce.Config.S2_API_KEY_FILE, codes, seen[:] = f'{TMP}/no-such-key', iter([200]), []
+        ce.search_s2('q')
+        assert seen == [{}], 'sent a key header without a key'
+    finally:
+        ce.Config.S2_API_KEY_FILE = old
+        [u() for u in undo]
+
+
 def test_external_query_filter():
     ce._private_terms = None
     ok = lambda t, **kw: ce.safe_external_query(t, **kw)[0]
