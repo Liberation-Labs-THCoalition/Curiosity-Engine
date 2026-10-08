@@ -8,11 +8,11 @@ Curiosity Engine is a queue-based research system that searches four academic da
 
 - **Multi-database search** -- queries arXiv, Semantic Scholar, OpenAlex, and PubMed in parallel with automatic rate-limit handling
 - **Automatic deduplication** -- normalized title matching removes duplicate papers across sources
-- **Curiosity-driven follow-ups** -- uses an LLM (Claude CLI) to generate follow-up research questions from gaps in results
+- **Curiosity-driven follow-ups** -- uses an LLM (Claude CLI, or a local model through Ollama) to generate follow-up research questions from gaps in results
 - **Depth-capped branching** -- configurable maximum depth prevents infinite recursion in research trees
 - **Semantic novelty detection** -- sentence-transformer embeddings detect when a follow-up is too similar to existing queue items (optional, requires `sentence-transformers`)
 - **Interest decay** -- threads that return too few papers are pruned automatically
-- **Memory scanning** -- queries a PostgreSQL memory store for unresolved thoughts and open questions, then generates new research topics (optional, requires `psycopg2`)
+- **Memory scanning** -- queries a PostgreSQL or SQLite (mcp-memory-service) memory store for unresolved thoughts and open questions, then generates new research topics (optional; see [Running locally](#running-locally-sqlite--ollama))
 - **Message bus integration (CAOGL)** -- monitors a JSON inbox file for research requests from other agents or systems
 - **Desktop idea file intake** -- watches a markdown file for manually added research ideas, auto-queues them, and marks them as processed
 - **Structured markdown reports** -- date-organized output with citation counts, author lists, abstracts, and summary statistics
@@ -58,6 +58,7 @@ Queue item statuses:
 - `[~]` in_progress -- currently being researched
 - `[x]` completed -- report generated
 - `[!]` failed -- error during processing
+- `[-]` skipped -- an engine-written topic off the asker's fields (see [the asker file](#the-asker-file))
 
 ## Architecture
 
@@ -122,10 +123,119 @@ All configuration is via environment variables. Set them in your shell or in a `
 | `POLL_INTERVAL` | 300s | Daemon polling interval |
 | `MAX_PAPERS_PER_DB` | 10 | Maximum papers to fetch per database |
 | `MAX_FOLLOWUPS_PER_ITEM` | 2 | Follow-up questions generated per topic |
-| `MAX_DEPTH` | 3 | Maximum branching depth |
+| `MAX_DEPTH` | 2 | Maximum branching depth (`MAX_DEPTH_NOVEL`, 3, when a thread finds at least 3 papers its ancestors did not) |
+| `RELEVANCE_THRESHOLD` | 0.3 | Minimum cosine similarity between a paper's abstract and the topic for the paper to be kept |
 | `NOVELTY_THRESHOLD` | 0.75 | Cosine similarity cutoff for deduplication |
 | `MIN_QUALITY_SCORE` | 3 | Minimum papers to continue a branch |
 | `MEMORY_SCAN_INTERVAL` | 6 hours | Time between memory scans |
+
+## Running locally (SQLite + Ollama)
+
+The engine can run with no Claude CLI and no PostgreSQL: a local model served by [Ollama](https://ollama.com) writes the topics, the memory it scans is an [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) SQLite store, and cron runs it with `run-once`. Apart from the academic searches (and the embedding model's first download), nothing leaves the machine unless you configure it to, and every topic an LLM writes passes a privacy filter before it is searched.
+
+### Requirements
+
+- Python 3 (tested on 3.12) with `requests`; add `sentence-transformers` for the relevance, novelty and asker checks (without it they are off, and the engine says so in the log)
+- Ollama with a model pulled. It was tested with `qwen3:4b` (`ollama pull qwen3:4b`); the default name is `mistral:7b`
+- Optional: an mcp-memory-service SQLite database to scan, and its HTTP API to store a one-line summary of each run
+
+### Settings
+
+The engine reads only its environment; it does not load a `.env` file itself. Export the settings, or keep them in a file under `data/` and source it (`set -a; . ./data/local.env; set +a`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `CURIOSITY_LLM` | `claude` | `ollama` to use a local model |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
+| `CURIOSITY_OLLAMA_MODEL` | `mistral:7b` | Model name. Reasoning models (`qwen3`, `deepseek-r1`) are sent `think: false` |
+| `CURIOSITY_OLLAMA_NUM_CTX` | `2048` | Context size. Match any other program that uses the same model, or Ollama reloads it for each |
+| `CLAUDE_CLI` | `claude` | Set to `/bin/false` to be sure nothing calls the Claude CLI |
+| `CURIOSITY_MEMORY_DB` | *(off)* | Path to an mcp-memory-service SQLite database. The memory scan opens it read-only |
+| `CURIOSITY_SELF_AGENT_TAG` | *(off)* | The tag that marks the scanning agent's own memories, e.g. `agent:me`. A memory tagged for any other agent is never read; unset, only memories without an `agent:` tag are |
+| `CURIOSITY_PRIORITY_TAGS` | *(none)* | Comma-separated tags whose memories the scan reads first |
+| `CURIOSITY_REFLECTIONS_DIR` | *(off)* | A directory of markdown reflections: one open question from each of the newest files, up to 4 per scan |
+| `CURIOSITY_MEMORY_API` + `MCP_API_KEY` | *(off)* | mcp-memory-service HTTP API (Bearer key) for a one-line summary of each run, stored as type `research` |
+| `CURIOSITY_ITEMS_PER_RUN` | `1` | Items processed by each `run-once` |
+| `CURIOSITY_ASKER_FILE` | *(off)* | Who is asking; see [the asker file](#the-asker-file) |
+| `CURIOSITY_PRIVATE_TERMS` | `./data/private_terms.txt` | Names that must never reach a public search; see [the private-terms filter](#the-private-terms-filter) |
+| `CURIOSITY_STATE`, `CURIOSITY_LOCK` | `./data/state.json`, `./data/run.lock` | When the memory was last scanned; the lock that keeps two runs from overlapping |
+| `S2_API_KEY` or `S2_API_KEY_FILE` | *(off)* | Semantic Scholar API key, or a file holding it. The anonymous pool is shared and often answers 429 |
+| `CURIOSITY_EMBED_MODEL`, `CURIOSITY_EMBED_DEVICE` | `all-mpnet-base-v2`, `cpu` | Embedding model and device. The thresholds and the asker check were tuned on the default model |
+| `CURIOSITY_GRAPH_URL` | *(off)* | A HippoRAG-style service (`POST /index`) to index the papers found |
+| `TGS_RAG_URL`; `WIKI_URL`, `WIKI_USER`, `WIKI_PASS` | *(off)* | Internal knowledge-base search (`POST /retrieve`) and wiki search (`POST /api/query`, basic auth). Their results go into the reports only, never into a prompt or a public query |
+
+### Run
+
+```bash
+export CURIOSITY_LLM=ollama CURIOSITY_OLLAMA_MODEL=qwen3:4b CLAUDE_CLI=/bin/false
+export CURIOSITY_MEMORY_DB=/path/to/memory.db CURIOSITY_SELF_AGENT_TAG=agent:me
+export CURIOSITY_ASKER_FILE=./data/asker.md
+python curiosity_engine.py run-once
+```
+
+Each `run-once` takes in the idea file and the inbox, scans memory (at most every 6 hours; the time is kept in `CURIOSITY_STATE`, so it holds across cron runs), puts items left `in_progress` by a run that died (over 6 hours ago) back in the queue, and then processes up to `CURIOSITY_ITEMS_PER_RUN` items. It prints `Completed: <topic>` for each item done. From cron:
+
+```
+57 */4 * * * cd /path/to/curiosity-engine && set -a && . ./data/local.env && set +a && python curiosity_engine.py run-once >> output/cron.log 2>&1
+```
+
+Besides the report in `output/<date>/`, each item gets a compact `.dno` digest beside it and an entry in `output/digest/<date>.md`: the papers found, and the local model's reading of the abstracts, labelled unverified.
+
+### The asker file
+
+Topics written by a small model drift: it keeps a word and loses its sense. The asker file says who is asking and what their words mean. It is markdown: prose first, then up to three lists.
+
+```markdown
+# Who is asking
+
+A research assistant agent that keeps notes on its own retrieval system.
+- "memory" means a store of past conversations, not hardware.
+
+## Fields
+
+- retrieval-augmented generation and long-term memory for language-model agents
+- evaluation of question answering over long documents
+
+## Not these
+
+- computer memory hardware, DRAM and caches
+- human memory and neuroscience
+
+## Requesters
+
+- research-agent
+```
+
+A thread is the asker's when its first item came from the memory scan, or from a requester listed under `## Requesters`. In the asker's threads:
+
+- the prose and the fields go into the prompts that write topics, with the question the thread began with;
+- a topic the engine writes is dropped (at the scan or the follow-up), or marked `skipped` when it comes up in the queue, if its embedding is closer to a "Not these" line than to any field. A skipped item stays in the queue with its reason; set it back to `pending` to research it anyway.
+
+A topic somebody queued (`add`, requester `user`) is never gated, and neither is anything in a thread somebody else began. Without the file nothing changes.
+
+### The private-terms filter
+
+Every topic an LLM writes, from the memory scan or as a follow-up, is checked before it can be sent to arXiv, Semantic Scholar, OpenAlex or PubMed. It is refused if it holds a term from the private-terms file (whole words, any case, any spacing), an `@`, a URL or a `.com`/`.org`/`.net`/`.io`/`.tech` domain, a home or system path (`~/`, `/home/`, `/opt/`, `/etc/`), a port (`:8080`), an IPv4 address or a credential-shaped string, or if it is shorter than 15 or longer than 150 characters. Topics from the memory scan fail closed: with the file missing or empty, none is queued.
+
+The file has one name or phrase per line, with `#` comments:
+
+```
+# people
+Jane Doe
+# machines, accounts and projects
+build-server-01
+Project Nightingale
+```
+
+List every person, machine, account and project name that must never appear in a public query, and add new ones as they come. Memory fragments and reflection sentences that look like credentials or IP addresses are dropped before they reach a prompt at all, and internal search results never enter one.
+
+### Keep `data/` local
+
+`data/` and `output/` are in `.gitignore`. The queue, the scan state and the lock live there by default; keep the asker file, the private-terms file and your settings there too. They describe the people and machines around you, and they do not belong in a repository.
+
+### Tests
+
+`python test_port.py` runs the tests for this mode without pytest. They write only to a temporary directory, override any deployment settings in the environment, and stub the network calls. One test needs the embedding model and is skipped with a note when it is not available; set `HF_HUB_OFFLINE=1` to keep sentence-transformers from contacting the Hugging Face Hub.
 
 ## How It Works
 
