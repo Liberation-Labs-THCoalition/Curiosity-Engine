@@ -17,7 +17,7 @@ Version: 2.0.0
 License: MIT
 """
 
-import json, os, sys, time, uuid, logging, re, hashlib, subprocess
+import json, os, sys, time, uuid, logging, re, hashlib, subprocess, sqlite3, fcntl, difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -58,6 +58,19 @@ class Config:
     PID_FILE = os.environ.get("CURIOSITY_PID", "./data/runner.pid")
     OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
 
+    # Nexus port (2026-10-05): a SQLite memory store (mcp-memory-service schema) as well as PostgreSQL, storage through
+    # the memory service's HTTP API, graph ingestion opt-in, and a run-once that seeds and recovers its own queue.
+    MEMORY_DB = os.environ.get("CURIOSITY_MEMORY_DB", "")
+    MEMORY_API_URL = os.environ.get("CURIOSITY_MEMORY_API", "")
+    MEMORY_API_KEY = os.environ.get("MCP_API_KEY", "")
+    GRAPH_URL = os.environ.get("CURIOSITY_GRAPH_URL", "")  # opt-in: see _ingest_to_graph
+    STATE_FILE = os.environ.get("CURIOSITY_STATE", "./data/state.json")
+    LOCK_FILE = os.environ.get("CURIOSITY_LOCK", "./data/run.lock")
+    PRIVATE_TERMS_FILE = os.environ.get("CURIOSITY_PRIVATE_TERMS", "./data/private_terms.txt")
+    ITEMS_PER_RUN = int(os.environ.get("CURIOSITY_ITEMS_PER_RUN", "1"))
+    STUCK_AFTER_S = 6 * 3600  # an in_progress item older than this died with its run
+    MAX_ATTEMPTS = 2
+
     @classmethod
     def use_ollama(cls):
         return cls.LLM_BACKEND.lower() == "ollama"
@@ -80,6 +93,7 @@ class Config:
     ENABLE_MEMORY_SCAN = True
     MEMORY_SCAN_INTERVAL = 3600 * 6  # Every 6 hours
     MEMORY_SCAN_LIMIT = 5  # Max topics to queue per scan
+    MEMORY_SCAN_DAYS = 90  # SQLite scan window
 
     # API endpoints
     ARXIV_API = "http://export.arxiv.org/api/query"
@@ -96,21 +110,23 @@ def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(Config.LOG_FILE, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        # stdout only at a terminal: cron appends stdout to this same file, which wrote every line twice
+        handlers=[logging.FileHandler(Config.LOG_FILE, encoding='utf-8')]
+                 + ([logging.StreamHandler(sys.stdout)] if sys.stdout.isatty() else [])
     )
     return logging.getLogger(__name__)
 
 log = setup_logging()
+# sentence-transformers draws a progress bar for every encode() whenever its logger is at INFO, which basicConfig above
+# makes it; under cron each bar landed in runner.log (Nexus 2026-10-05). TQDM_DISABLE did not stop it.
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
 if not _HAS_SENTENCE_TRANSFORMERS:
     log.warning("sentence-transformers not installed — semantic novelty detection disabled")
-if not _HAS_PSYCOPG2:
+if Config.POSTGRES_URL and not _HAS_PSYCOPG2:
     log.warning("psycopg2 not installed — PostgreSQL memory storage disabled")
-if not Config.POSTGRES_URL:
-    log.info("DATABASE_URL not set — memory storage and memory scanning disabled")
+if not Config.POSTGRES_URL and not Config.MEMORY_DB:
+    log.info("Neither DATABASE_URL nor CURIOSITY_MEMORY_DB is set — memory scanning disabled")
 
 
 # ==================== QUEUE MANAGEMENT ====================
@@ -190,29 +206,30 @@ def _search_internal(query: str, max_results: int = 5) -> List[Dict]:
     except Exception as e:
         log.debug(f"TGS-RAG search failed: {e}")
 
-    # Wiki search
-    try:
-        resp = requests.post(
-            f"{WIKI_URL}/api/query",
-            json={"query": query, "num": max_results},
-            auth=(WIKI_USER, WIKI_PASS),
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for doc in data.get("docs", [])[:max_results]:
-                if isinstance(doc, str) and len(doc) > 50:
-                    results.append({
-                        "title": doc[:100].strip(),
-                        "abstract": doc,
-                        "source": "internal/wiki",
-                        "year": "",
-                        "authors": ["Coalition Lab Wiki"],
-                        "url": f"{WIKI_URL}/search?q={query}",
-                        "citation_count": 0,
-                    })
-    except Exception as e:
-        log.debug(f"Wiki search failed: {e}")
+    # Wiki search, only with credentials from the environment
+    if WIKI_PASS:
+        try:
+            resp = requests.post(
+                f"{WIKI_URL}/api/query",
+                json={"query": query, "num": max_results},
+                auth=(WIKI_USER, WIKI_PASS),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                for doc in data.get("docs", [])[:max_results]:
+                    if isinstance(doc, str) and len(doc) > 50:
+                        results.append({
+                            "title": doc[:100].strip(),
+                            "abstract": doc,
+                            "source": "internal/wiki",
+                            "year": "",
+                            "authors": ["Coalition Lab Wiki"],
+                            "url": f"{WIKI_URL}/search?q={query}",
+                            "citation_count": 0,
+                        })
+        except Exception as e:
+            log.debug(f"Wiki search failed: {e}")
 
     return results
 
@@ -440,6 +457,25 @@ def relevance_gate(papers: List[Dict], query: str) -> List[Dict]:
         return papers
 
 
+_QUERY_STOP = {"a", "an", "the", "of", "in", "on", "for", "and", "or", "to", "is", "are", "was", "were", "be", "been",
+               "how", "what", "why", "which", "when", "where", "who", "does", "do", "did", "can", "could", "would",
+               "should", "may", "might", "will", "with", "within", "by", "as", "at", "from", "into", "across", "between",
+               "during", "that", "this", "these", "those", "it", "its", "their", "there", "we", "our"}
+
+
+def search_query(topic: str) -> str:
+    """Keywords for the search APIs; the topic itself stays a readable question.
+
+    On 2026-10-05 memory-derived topics came out as whole questions: OpenAlex answered both with HTTP 400 and PubMed,
+    which ANDs every word, found nothing. Duplicate words (a parent term already in the topic) are dropped."""
+    seen, kept = set(), []
+    for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", topic):
+        if w.lower() not in _QUERY_STOP and w.lower() not in seen:
+            seen.add(w.lower())
+            kept.append(w)
+    return " ".join(kept[:12]) or topic
+
+
 def extract_parent_terms(item: Dict) -> List[str]:
     """Extract key terms from parent topic for search narrowing at depth.
 
@@ -507,14 +543,18 @@ def generate_report(item: Dict, papers: List[Dict]) -> str:
             f"",
         ])
 
+    # A list of internal results only (no year, `citation_count` instead of `citations`) crashed both lines below, and
+    # a crash left the item in_progress for good (Nexus 2026-10-05: 22 such items, none with a report).
+    years = [p['year'] for p in papers if p.get('year')]
+    top_cites = papers[0].get('citations') or papers[0].get('citation_count') or 'N/A'
     lines.extend([
         "---",
         "",
         "## Summary Statistics",
         f"- Total unique papers: {len(papers)}",
-        f"- Year range: {min(p['year'] for p in papers if p['year'])} - {max(p['year'] for p in papers if p['year'])}",
+        f"- Year range: {min(years)} - {max(years)}" if years else "- Year range: n/a",
         f"- Sources: {', '.join(set(p['source'] for p in papers))}",
-        f"- Most cited: {papers[0]['title']} ({papers[0]['citations'] or 'N/A'} citations)",
+        f"- Most cited: {papers[0]['title']} ({top_cites} citations)",
     ])
 
     return "\n".join(lines)
@@ -544,7 +584,12 @@ def generate_digest(item: Dict, papers: List[Dict]) -> str:
 
 def _ingest_to_graph(papers: List[Dict]):
     """Index discovered papers into the federated knowledge graph (HippoRAG)."""
-    hipporag_url = os.environ.get("HIPPORAG_URL", "http://localhost:11235")
+    # Opt-in only (Nexus 2026-10-05). This used to default to a local port that once served a shared graph; in the
+    # deployment it was written for, that port became a private memory store, and every paper indexed costs an LLM
+    # extraction.
+    hipporag_url = Config.GRAPH_URL
+    if not hipporag_url:
+        return
 
     # Filter to external papers only (skip internal/wiki results)
     external = [p for p in papers
@@ -596,17 +641,50 @@ def _ingest_to_graph(papers: List[Dict]):
 
 
 def store_in_memory(item: Dict, papers: List[Dict]):
-    """Store research summary in PostgreSQL memory (if configured)."""
-    if not Config.POSTGRES_URL or not _HAS_PSYCOPG2 or not _HAS_SENTENCE_TRANSFORMERS:
-        return
+    """Store a one-line research summary: PostgreSQL (if configured) or the memory service's HTTP API.
+
+    Built from external papers only. An internal result's title is a slice of a memory, and storing it again as
+    "research" would copy a memory into a new one (Nexus 2026-10-05)."""
+    external = [p for p in papers if not str(p.get("source", "")).startswith("internal/")]
+    if not external:
+        return  # "found 0 papers" is noise in a memory store (one was stored on the first live run, 2026-10-05)
+    summary = f"Research on '{item['topic']}': found {len(external)} papers. "
+    if external:
+        top = external[0]
+        summary += f"Top result: '{top['title']}' ({top['year']}). "
+        summary += f"Sources: {', '.join(sorted(set(p['source'] for p in external)))}."
+    if Config.POSTGRES_URL and _HAS_PSYCOPG2 and _HAS_SENTENCE_TRANSFORMERS:
+        _store_postgres(item, summary)
+    elif Config.MEMORY_API_URL and Config.MEMORY_API_KEY:
+        _store_api(item, summary)
+
+
+def _store_api(item: Dict, summary: str):
+    """POST the summary to mcp-memory-service (/api/memories, Bearer key), as the service's other HTTP clients do."""
+    try:
+        resp = requests.post(
+            f"{Config.MEMORY_API_URL.rstrip('/')}/api/memories",
+            json={
+                "content": summary,
+                "tags": ["curiosity-engine", "auto_research"],
+                "memory_type": "research",
+                "metadata": {"research_id": item["id"], "requester": item["requester"],
+                             "depth": item.get("depth", 0), "source": "curiosity-engine"},
+            },
+            headers={"Authorization": f"Bearer {Config.MEMORY_API_KEY}"},
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            log.info("Stored research summary in memory")
+        else:
+            log.warning(f"Memory storage failed (non-fatal): HTTP {resp.status_code}")
+    except Exception as e:
+        log.warning(f"Memory storage failed (non-fatal): {type(e).__name__}")
+
+
+def _store_postgres(item: Dict, summary: str):
     try:
         model = _get_st_model()
-        summary = f"Research on '{item['topic']}': found {len(papers)} papers. "
-        if papers:
-            top = papers[0]
-            summary += f"Top result: '{top['title']}' ({top['year']}). "
-            summary += f"Sources: {', '.join(set(p['source'] for p in papers))}."
-
         embedding = model.encode(summary).tolist()
 
         conn = psycopg2.connect(Config.POSTGRES_URL)
@@ -724,21 +802,33 @@ def check_idea_file():
 
 # ==================== CURIOSITY ENGINE ====================
 
-def ask_ollama(prompt: str, max_tokens: int = 300) -> Optional[str]:
-    """Send a prompt to Ollama and return the response text."""
+def ask_ollama(prompt: str, max_tokens: int = 300, schema: Optional[Dict] = None) -> Optional[str]:
+    """Send a prompt to Ollama and return the response text.
+
+    With a schema, `format` constrains generation to it. Asking politely for a format is not enough for a 4B model:
+    on 2026-10-05 qwen3:4b spent its whole budget on "We are given..." and wrote no topic at all. num_ctx 2048 matches
+    another local consumer of the same model, which measured 4096 at 291 MiB more VRAM on a shared 4 GB card
+    (evictions, CPU fallback), and a second consumer asking a different num_ctx of the same model makes Ollama
+    reload it."""
+    body = {
+        'model': Config.OLLAMA_MODEL,
+        'prompt': prompt,
+        'stream': False,
+        'options': {'num_predict': max_tokens, 'temperature': 0.7, 'num_ctx': 2048},
+    }
+    if schema is not None:
+        body['format'] = schema
+    # Reasoning models put their output in a separate `thinking` field unless think=False is passed as an API field.
+    # With only a prompt directive the whole budget went to thinking and `response` came back empty (seen in another
+    # local consumer, 2026-09), so it is sent for these models.
+    if any(k in Config.OLLAMA_MODEL for k in ('qwen3', 'deepseek-r1')):
+        body['think'] = False
     try:
-        resp = requests.post(
-            f'{Config.OLLAMA_URL}/api/generate',
-            json={
-                'model': Config.OLLAMA_MODEL,
-                'prompt': prompt,
-                'stream': False,
-                'options': {'num_predict': max_tokens, 'temperature': 0.7},
-            },
-            timeout=90,
-        )
+        resp = requests.post(f'{Config.OLLAMA_URL}/api/generate', json=body, timeout=180)
         if resp.status_code == 200:
-            return resp.json().get('response', '').strip()
+            text = resp.json().get('response', '')
+            return re.sub(r'<think>.*?</think>', '', text, flags=re.S).strip()
+        log.warning(f"Ollama HTTP {resp.status_code}")
     except Exception as e:
         log.warning(f"Ollama error: {e}")
     return None
@@ -768,10 +858,10 @@ def ask_claude(prompt: str) -> Optional[str]:
         return None
 
 
-def ask_llm(prompt: str, max_tokens: int = 300) -> Optional[str]:
-    """Route prompt to configured LLM backend."""
+def ask_llm(prompt: str, max_tokens: int = 300, schema: Optional[Dict] = None) -> Optional[str]:
+    """Route prompt to configured LLM backend. The schema binds Ollama only; the prompt asks every backend for it."""
     if Config.use_ollama():
-        return ask_ollama(prompt, max_tokens)
+        return ask_ollama(prompt, max_tokens, schema)
     return ask_claude(prompt)
 
 
@@ -780,9 +870,13 @@ def generate_followups(item: Dict, papers: List[Dict]) -> List[str]:
     if not Config.ENABLE_FOLLOWUPS or not papers:
         return []
 
-    # Build context from top 5 papers
+    # Build context from the top 5 EXTERNAL papers. Internal results are memory and wiki text, and whatever enters this
+    # prompt can come back out inside a query sent to public APIs (Nexus 2026-10-05).
+    external = [p for p in papers if not str(p.get("source", "")).startswith("internal/")]
+    if not external:
+        return []
     paper_summaries = []
-    for p in papers[:5]:
+    for p in external[:5]:
         cite_str = f" ({p['citations']} citations)" if p.get('citations') else ""
         paper_summaries.append(f"- {p['title']} ({p['year']}){cite_str}: {p['abstract'][:200]}")
 
@@ -804,17 +898,13 @@ Based on gaps, tensions, or unexplored angles in these results, suggest exactly 
 - Different from the original topic
 - Focused on an underexplored connection or open question{f'{chr(10)}- Related to the parent thread terms: {", ".join(parent_terms)}' if parent_terms else ''}
 
-Reply with ONLY the questions, one per line, no numbering, bullets, or commentary."""
+Reply with JSON only, in the form {{"topics": ["...", "..."]}}."""
 
-    raw = ask_llm(prompt)
+    raw = ask_llm(prompt, schema=TOPICS_SCHEMA)
     if not raw:
         return []
 
-    lines = [l.strip() for l in raw.split('\n') if l.strip()]
-    # Strip numbering, bullets, quotes
-    lines = [re.sub(r'^[\d]+[\.\)]\s*', '', l) for l in lines]
-    lines = [re.sub(r'^[-*•]\s*', '', l) for l in lines]
-    lines = [l.strip('"\'') for l in lines]
+    lines = _parse_topics(raw, prompt)
     reject_patterns = ["I'm Claude", "I am Claude", "I appreciate", "I need to clarify",
                        "I should note", "doesn't apply", "I can help", "as an AI",
                        "I'm Qwen", "I am Qwen", "I'm Mistral", "I am Mistral"]
@@ -824,6 +914,10 @@ Reply with ONLY the questions, one per line, no numbering, bullets, or commentar
             continue
         if any(pat.lower() in line.lower() for pat in reject_patterns):
             continue
+        ok, why = safe_external_query(line)
+        if not ok:
+            log.info(f"  Follow-up rejected before any external search ({why})")
+            continue
         followups.append(line)
     followups = followups[:Config.MAX_FOLLOWUPS_PER_ITEM]
     if followups:
@@ -832,16 +926,26 @@ Reply with ONLY the questions, one per line, no numbering, bullets, or commentar
 
 
 _st_model = None
+_st_failed = False
 
 def _get_st_model():
-    """Lazy-load and cache SentenceTransformer model."""
-    global _st_model
-    if _st_model is None:
+    """Lazy-load and cache SentenceTransformer model.
+
+    The thresholds in Config (novelty 0.75, relevance 0.3) were tuned on all-mpnet-base-v2; a different model needs
+    them re-tuned. It runs on the CPU, leaving the GPU to Ollama (Nexus 2026-10-05)."""
+    global _st_model, _st_failed
+    if _st_model is None and not _st_failed:
         if not _HAS_SENTENCE_TRANSFORMERS:
             return None
-        _st_model = SentenceTransformer("all-mpnet-base-v2")
+        try:
+            _st_model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+        except Exception as e:
+            _st_failed = True
+            log.warning(f"Embedding model unavailable ({type(e).__name__}) — relevance and novelty checks off this run")
     return _st_model
 
+
+_topic_emb = {}
 
 def is_semantically_duplicate(new_topic: str, queue: List[Dict]) -> bool:
     """Check if a follow-up is too similar to existing queue items."""
@@ -855,7 +959,12 @@ def is_semantically_duplicate(new_topic: str, queue: List[Dict]) -> bool:
         existing_topics = [item["topic"] for item in queue]
         if not existing_topics:
             return False
-        existing_embs = model.encode(existing_topics)
+        # Cached for the process: every candidate used to re-encode the whole queue on the CPU (176 topics, ~23 s each)
+        missing = [t for t in dict.fromkeys(existing_topics) if t not in _topic_emb]
+        if missing:
+            for t, e in zip(missing, model.encode(missing)):
+                _topic_emb[t] = e
+        existing_embs = [_topic_emb[t] for t in existing_topics]
 
         for i, existing_emb in enumerate(existing_embs):
             dot = sum(a * b for a, b in zip(new_emb, existing_emb))
@@ -945,53 +1054,186 @@ def queue_followups(followups: List[str], parent_item: Dict):
 
 # ==================== MEMORY SCANNING ====================
 
-_last_memory_scan = 0
+def _load_state() -> Dict:
+    try:
+        with open(Config.STATE_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(state: Dict):
+    os.makedirs(os.path.dirname(Config.STATE_FILE) or ".", exist_ok=True)
+    with open(Config.STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+
+
+def _secretish(text: str) -> bool:
+    """Shaped like a credential, a key block or an IP address. Such text never reaches a prompt or a query."""
+    return bool(re.search(r'[A-Za-z0-9_\-]{32,}|\b(hf|sk|ghp|gho|xox[abp])[-_][A-Za-z0-9]{8,}'
+                          r'|\b\d{1,3}(\.\d{1,3}){3}\b|-----BEGIN', text))
+
+
+_private_terms = None
+
+def _private_term_patterns() -> List:
+    """Whole-word, case-insensitive patterns from the private-terms file: one name or phrase per line, # comments.
+    The file lives beside the queue (gitignored), so the names in it never enter this public repository."""
+    global _private_terms
+    if _private_terms is None:
+        _private_terms = []
+        try:
+            with open(Config.PRIVATE_TERMS_FILE, encoding='utf-8') as f:
+                for line in f:
+                    term = line.split('#', 1)[0].strip()
+                    if term:
+                        _private_terms.append(re.compile(
+                            r'\b' + r'\s+'.join(map(re.escape, term.split())) + r'\b', re.I))
+        except FileNotFoundError:
+            pass
+    return _private_terms
+
+
+def safe_external_query(topic: str, require_terms: bool = False):
+    """(ok, reason). An LLM-written topic is sent to public search APIs, so it must not carry anything private: a name
+    from the private-terms file, an address, a path, a port, an email, or a credential-shaped string (Nexus
+    2026-10-05). With require_terms, a missing terms file refuses everything: memory-derived topics fail closed."""
+    t = topic.strip()
+    if not 15 <= len(t) <= 150:
+        return False, "length"
+    if re.search(r'@|https?://|www\.|:\d{4,5}\b|~/|/home/|/opt/|/etc/|\.(tech|org|com|net|io)\b', t, re.I):
+        return False, "address or path"
+    if _secretish(t):
+        return False, "credential-shaped"
+    terms = _private_term_patterns()
+    if require_terms and not terms:
+        return False, "private-terms file missing or empty"
+    for pat in terms:
+        if pat.search(t):
+            return False, "private term"
+    return True, ""
+
+
+TOPICS_SCHEMA = {"type": "object", "required": ["topics"],
+                 "properties": {"topics": {"type": "array", "items": {"type": "string"}}}}
+
+
+def _candidate_topics(raw: str) -> List[str]:
+    """{"topics": [...]} first (Ollama enforces it with TOPICS_SCHEMA), else TOPIC: lines from other backends."""
+    try:
+        obj = json.loads(raw[raw.index('{'):raw.rindex('}') + 1])
+        if isinstance(obj, dict) and isinstance(obj.get('topics'), list):
+            return [t for t in obj['topics'] if isinstance(t, str)]
+    except ValueError:  # no braces, or not JSON
+        pass
+    return [m.group(1) for m in (re.match(r'^\s*(?:[-*•]|\d+[.)])?\s*TOPIC\s*:\s*(.+)$', l, re.I)
+                                 for l in raw.split('\n')) if m]
+
+
+def _parse_topics(raw: str, prompt: str) -> List[str]:
+    """Topics from a "TOPIC: ..." reply.
+
+    A small model echoes its own instructions: on 2026-10-05 qwen3:4b's first scan queued "A specific, searchable
+    academic query" as a research topic. So only TOPIC: lines count, and a placeholder, a copy of prompt text, or a
+    near-copy of a prompt line is dropped. A copy of a memory fragment is dropped too, since fragments are prompt text."""
+    lowered = prompt.lower()
+    prompt_lines = [re.sub(r'^[-*•\d.)\s]+', '', l).strip().lower() for l in prompt.split('\n') if len(l.strip()) > 10]
+    topics = []
+    for t in _candidate_topics(raw):
+        t = t.strip().strip('"\'').strip()
+        low = t.lower()
+        if len(t) <= 10 or '<' in t or '>' in t or low == 'none':
+            continue
+        if low in lowered or any(difflib.SequenceMatcher(None, low, pl).ratio() > 0.8 for pl in prompt_lines):
+            continue
+        topics.append(t)
+    return topics
+
+
+CURIOSITY_PHRASES = ["I wonder", "curious about", "curious whether", "open question", "worth exploring",
+                     "unresolved", "unsolved", "further research", "can't explain", "don't understand why"]
+
+
+def _memory_fragments_sqlite(limit: int = 20) -> List[str]:
+    """Recent memories in the asker's own words that hold an open question, from an mcp-memory-service SQLite store.
+
+    Only the asker's words: never a human's turn (role:user), never another agent's letter, never a consolidation pointer,
+    never this engine's own summaries. Tags are matched without quotes: the HTTP API stores them comma-separated (all
+    17,421 rows on 2026-10-05), and a first version that expected JSON quoting filtered nothing. The old Postgres phrases ("investigate", "follow up") matched operational
+    chatter, so the phrases here are ones that mark curiosity. SQLite's LIKE ignores ASCII case."""
+    since = time.time() - Config.MEMORY_SCAN_DAYS * 86400
+    like = " OR ".join("content LIKE ?" for _ in CURIOSITY_PHRASES)
+    con = sqlite3.connect(f"file:{Config.MEMORY_DB}?mode=ro", uri=True, timeout=15)
+    try:
+        rows = con.execute(f"""
+            SELECT content FROM memories
+            WHERE deleted_at IS NULL AND created_at > ?
+              AND content NOT LIKE 'Association between memories %'
+              AND COALESCE(memory_type, '') != 'research'
+              AND COALESCE(tags, '') NOT LIKE '%role:user%'
+              AND COALESCE(tags, '') NOT LIKE '%curiosity-engine%'
+              AND (COALESCE(tags, '') NOT LIKE '%agent:%' OR tags LIKE '%agent:operator%')
+              AND ({like})
+            ORDER BY (COALESCE(tags, '') LIKE '%topic:research%' OR COALESCE(tags, '') LIKE '%topic:consciousness%') DESC,
+                     created_at DESC
+            LIMIT ?""", (since, *[f"%{ph}%" for ph in CURIOSITY_PHRASES], limit)).fetchall()
+    finally:
+        con.close()
+    return [r[0] for r in rows if not _secretish(r[0])]
+
+
+def _memory_fragments_pg() -> List[str]:
+    conn = psycopg2.connect(Config.POSTGRES_URL)
+    cur = conn.cursor()
+    # Find memories tagged with research-adjacent terms that might contain open questions
+    cur.execute("""
+        SELECT content FROM lyra_memories
+        WHERE (
+            content ILIKE '%%follow up%%'
+            OR content ILIKE '%%further research%%'
+            OR content ILIKE '%%open question%%'
+            OR content ILIKE '%%investigate%%'
+            OR content ILIKE '%%curious about%%'
+            OR content ILIKE '%%worth exploring%%'
+            OR content ILIKE '%%unresolved%%'
+            OR content ILIKE '%%suggested follow%%'
+        )
+        AND memory_type != 'research'
+        ORDER BY created_at DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [row[0] for row in rows]
+
 
 def scan_memories_for_threads():
     """Query memory for unresolved thoughts and open questions."""
-    global _last_memory_scan
-    now = time.time()
     if not Config.ENABLE_MEMORY_SCAN:
         return
-    if not Config.POSTGRES_URL or not _HAS_PSYCOPG2:
+    use_pg = bool(Config.POSTGRES_URL and _HAS_PSYCOPG2)
+    if not use_pg and not Config.MEMORY_DB:
         return
-    if now - _last_memory_scan < Config.MEMORY_SCAN_INTERVAL:
+    # The interval lives on disk. Under cron every run is a new process, so an in-memory timestamp gated nothing.
+    state = _load_state()
+    now = time.time()
+    if now - state.get("last_memory_scan", 0) < Config.MEMORY_SCAN_INTERVAL:
         return
-    _last_memory_scan = now
+    state["last_memory_scan"] = now
+    _save_state(state)
 
     log.info("Scanning memories for unresolved research threads...")
-
+    stats = {"fragments": 0, "topics": 0, "rejected": 0, "queued": 0}
     try:
-        conn = psycopg2.connect(Config.POSTGRES_URL)
-        cur = conn.cursor()
-
-        # Find memories tagged with research-adjacent terms that might contain open questions
-        cur.execute("""
-            SELECT content FROM lyra_memories
-            WHERE (
-                content ILIKE '%%follow up%%'
-                OR content ILIKE '%%further research%%'
-                OR content ILIKE '%%open question%%'
-                OR content ILIKE '%%investigate%%'
-                OR content ILIKE '%%curious about%%'
-                OR content ILIKE '%%worth exploring%%'
-                OR content ILIKE '%%unresolved%%'
-                OR content ILIKE '%%suggested follow%%'
-            )
-            AND memory_type != 'research'
-            ORDER BY created_at DESC
-            LIMIT 20
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
+        rows = _memory_fragments_pg() if use_pg else _memory_fragments_sqlite()
+        stats["fragments"] = len(rows)
         if not rows:
             log.info("  No unresolved threads found in memory")
             return
 
         # Use LLM to extract research-worthy questions from memory fragments
-        fragments = "\n".join(f"- {row[0][:300]}" for row in rows[:10])
+        fragments = "\n".join(f"- {row[:300]}" for row in rows[:10])
         prompt = f"""These are memory fragments from previous thinking that contain unresolved questions or threads:
 
 {fragments}
@@ -1000,35 +1242,120 @@ Extract up to {Config.MEMORY_SCAN_LIMIT} concrete research topics from these fra
 - A specific, searchable academic query
 - Something genuinely unresolved (not already answered in the fragment)
 - Worth investigating with academic literature
+- Free of personal names, project names, places and anything private: general academic terms only
 
-Reply with ONLY the topics, one per line, no numbering or bullets. If nothing is worth pursuing, reply with just "NONE"."""
+Reply with JSON only, in the form {{"topics": ["...", "..."]}}. If nothing is worth pursuing, reply {{"topics": []}}."""
 
-        try:
-            raw = ask_llm(prompt)
-            if not raw or "NONE" in raw:
-                log.info("  No actionable threads extracted from memory")
-                return
+        raw = ask_llm(prompt, max_tokens=400, schema=TOPICS_SCHEMA)
+        if not raw or raw.strip().upper().rstrip('.') == "NONE":
+            log.info("  No actionable threads extracted from memory")
+            return
 
-            topics = [l.strip() for l in raw.split('\n')
-                      if l.strip() and len(l.strip()) > 10]
+        topics = _parse_topics(raw, prompt)
+        stats["topics"] = len(topics)
 
+        queue = load_queue()
+        existing = {item["topic"].lower() for item in queue}
+        for topic in topics[:Config.MEMORY_SCAN_LIMIT]:
+            ok, why = safe_external_query(topic, require_terms=True)
+            if not ok:
+                stats["rejected"] += 1
+                log.info(f"  Memory topic rejected before any external search ({why})")
+                continue
+            if topic.lower() in existing or is_semantically_duplicate(topic, queue):
+                continue
+            add_to_queue(topic, priority=4, requester="memory_scan")
+            existing.add(topic.lower())
             queue = load_queue()
-            existing = {item["topic"].lower() for item in queue}
-
-            queued = 0
-            for topic in topics[:Config.MEMORY_SCAN_LIMIT]:
-                if topic.lower() not in existing:
-                    add_to_queue(topic, priority=4, requester="memory_scan")
-                    queued += 1
-
-            if queued:
-                log.info(f"  Queued {queued} topics from memory scan")
-
-        except Exception as e:
-            log.warning(f"Memory scan LLM extraction failed: {e}")
-
+            stats["queued"] += 1
+        log.info(f"  Memory scan: {stats['fragments']} fragments, {stats['topics']} topics, "
+                 f"{stats['rejected']} rejected, {stats['queued']} queued")
     except Exception as e:
-        log.warning(f"Memory scan failed: {e}")
+        log.warning(f"Memory scan failed: {type(e).__name__}: {e}")
+    finally:
+        state = _load_state()
+        state["last_scan_stats"] = dict(stats, at=datetime.now(timezone.utc).isoformat())
+        _save_state(state)
+
+
+def recover_stuck(queue: List[Dict]) -> int:
+    """Return in_progress items whose run died to pending, or to failed after MAX_ATTEMPTS.
+
+    Until 2026-10-05 nothing did: a crash in process_one left its item in_progress for good, and 22 sat there from
+    June on, none with a report. An item stranded before started_at existed goes behind anything fresh."""
+    now = time.time()
+    n = 0
+    for item in queue:
+        if item.get("status") != "in_progress":
+            continue
+        started = item.get("started_at")
+        try:
+            age = now - datetime.fromisoformat(started).timestamp() if started else None
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and age < Config.STUCK_AFTER_S:
+            continue
+        item["attempts"] = item.get("attempts", 0) + 1
+        if item["attempts"] > Config.MAX_ATTEMPTS:
+            item["status"] = "failed"
+        else:
+            item["status"] = "pending"
+            if started is None:
+                item["priority"] = max(item.get("priority", 3), 5)
+        n += 1
+    if n:
+        log.info(f"Recovered {n} stuck in_progress item(s)")
+    return n
+
+
+def run_once():
+    """One cron tick: take in new requests, recover the queue, then process up to ITEMS_PER_RUN items.
+
+    The old run-once only drained the queue. Seeding (memory scan, idea file, inbox) happened in the daemon loop alone,
+    so under cron the queue emptied in June and the engine printed "No pending items" from then on (Nexus 2026-10-05)."""
+    os.makedirs(os.path.dirname(Config.LOCK_FILE) or ".", exist_ok=True)
+    lock = open(Config.LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another run is active.")
+        return
+
+    check_idea_file()
+    check_caogl_inbox()
+    scan_memories_for_threads()
+    queue = load_queue()
+    if recover_stuck(queue):
+        save_queue(queue)
+
+    done = 0
+    for _ in range(max(1, Config.ITEMS_PER_RUN)):
+        queue = load_queue()
+        pending = sorted((i for i in queue if i["status"] == "pending"), key=lambda x: x.get("priority", 3))
+        if not pending:
+            break
+        item = pending[0]
+        item["status"] = "in_progress"
+        item["started_at"] = datetime.now(timezone.utc).isoformat()
+        save_queue(queue)
+        try:
+            process_one(item)
+            done += 1
+        except Exception as e:
+            log.error(f"Failed processing [{item['id']}]: {type(e).__name__}: {e}")
+            item["attempts"] = item.get("attempts", 0) + 1
+            item["status"] = "failed" if item["attempts"] > Config.MAX_ATTEMPTS else "pending"
+        # Reload queue to preserve any follow-ups added during processing
+        queue = load_queue()
+        for q_item in queue:
+            if q_item["id"] == item["id"]:
+                q_item.update(item)
+                break
+        save_queue(queue)
+        if item["status"] == "completed":
+            print(f"Completed: {item['topic']}")
+    if not done:
+        print("No pending items.")
 
 
 # ==================== MAIN LOOP ====================
@@ -1043,9 +1370,9 @@ def process_one(item: Dict) -> bool:
 
     # Lyra's suggestion 1: inherit parent terms at depth to narrow search
     parent_terms = extract_parent_terms(item)
-    search_topic = topic
+    search_topic = search_query(topic)
     if parent_terms and depth > 0:
-        search_topic = f"{topic} {' '.join(parent_terms)}"
+        search_topic = search_query(f"{topic} {' '.join(parent_terms)}")
         log.info(f"  Depth {depth}: narrowing search with parent terms: {parent_terms}")
 
     log.info(f"Processing [{item['id']}]: '{topic}'" +
@@ -1154,6 +1481,7 @@ def run():
             if pending:
                 item = pending[0]
                 item["status"] = "in_progress"
+                item["started_at"] = datetime.now(timezone.utc).isoformat()
                 save_queue(queue)
 
                 try:
@@ -1194,24 +1522,7 @@ if __name__ == "__main__":
                 icon = {"pending": "[.]", "in_progress": "[~]", "completed": "[x]", "failed": "[!]"}.get(status, "[?]")
                 print(f"  {icon} [{item['id']}] p{item['priority']} {item['topic']}")
         elif cmd == "run-once":
-            queue = load_queue()
-            pending = [i for i in queue if i["status"] == "pending"]
-            if pending:
-                pending.sort(key=lambda x: x.get("priority", 3))
-                item = pending[0]
-                item["status"] = "in_progress"
-                save_queue(queue)
-                process_one(item)
-                # Reload queue to preserve any follow-ups added during processing
-                queue = load_queue()
-                for q_item in queue:
-                    if q_item["id"] == item["id"]:
-                        q_item.update(item)
-                        break
-                save_queue(queue)
-                print(f"Completed: {item['topic']}")
-            else:
-                print("No pending items.")
+            run_once()
         else:
             print("Usage: curiosity_engine.py [add <topic> | list | run-once | <no args for daemon>]")
     else:
