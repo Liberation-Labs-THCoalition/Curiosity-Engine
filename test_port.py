@@ -3,6 +3,9 @@
 
 CE_DIR names the directory to import curiosity_engine from (default: this one). The mutation controls point it at a
 copy with one guard removed, and the matching test must fail. A test that cannot fail is not a test.
+
+Hermetic: every path the engine writes points into a fresh temp dir, and the settings below override whatever a
+deployment has in the caller's environment, so a run never reads or writes a live queue, memory store or data/ dir.
 """
 import json
 import os
@@ -19,6 +22,11 @@ os.environ.update({
     'CURIOSITY_PRIVATE_TERMS': f'{TMP}/terms.txt', 'CURIOSITY_INBOX': f'{TMP}/inbox.json',
     'CURIOSITY_LLM': 'ollama', 'CLAUDE_CLI': '/bin/false', 'DATABASE_URL': '', 'WIKI_PASS': '',
     'CURIOSITY_GRAPH_URL': '', 'CURIOSITY_MEMORY_API': '', 'MCP_API_KEY': '',
+    'CURIOSITY_MEMORY_DB': '', 'CURIOSITY_REFLECTIONS_DIR': '', 'CURIOSITY_ASKER_FILE': '', 'CURIOSITY_IDEAS': '',
+    'CURIOSITY_PID': f'{TMP}/runner.pid', 'CURIOSITY_ITEMS_PER_RUN': '1', 'S2_API_KEY': '', 'S2_API_KEY_FILE': '',
+    'TGS_RAG_URL': '', 'WIKI_URL': '', 'OLLAMA_URL': 'http://127.0.0.1:9', 'CURIOSITY_OLLAMA_NUM_CTX': '2048',
+    'CURIOSITY_EMBED_MODEL': 'all-mpnet-base-v2', 'CURIOSITY_EMBED_DEVICE': 'cpu',
+    'CURIOSITY_SELF_AGENT_TAG': 'agent:self', 'CURIOSITY_PRIORITY_TAGS': 'topic:research',
 })
 sys.path.insert(0, os.environ.get('CE_DIR', os.path.dirname(os.path.abspath(__file__))))
 import curiosity_engine as ce  # noqa: E402
@@ -64,17 +72,17 @@ def fixture_db():
                 'created_at REAL, deleted_at REAL)')
     day = 86400
     rows = [
-        ('MINE-RESEARCH I wonder whether attention sinks carry positional information', ['agent:operator', 'topic:research'], 'observation', NOW - 2 * day, None),
+        ('MINE-RESEARCH I wonder whether attention sinks carry positional information', ['agent:self', 'topic:research'], 'observation', NOW - 2 * day, None),
         ('Association between memories a and b: I wonder (ASSOC)', [], 'observation', NOW - day, None),
         ('HUMAN-TURN I wonder if we should rest today', ['verbatim', 'role:user'], 'observation', NOW - day, None),
         ('OWN-SUMMARY research I wonder', ['auto_research'], 'research', NOW - day, None),
-        ('DELETED I wonder about this', ['agent:operator'], 'observation', NOW - day, NOW),
-        ('OLD I wonder from long ago', ['agent:operator'], 'observation', NOW - 200 * day, None),
+        ('DELETED I wonder about this', ['agent:self'], 'observation', NOW - day, NOW),
+        ('OLD I wonder from long ago', ['agent:self'], 'observation', NOW - 200 * day, None),
         ('OTHER-LETTER an open question about cache geometry', ['agent:other'], 'observation', NOW - day, None),
-        ('SECRET I wonder about hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456', ['agent:operator'], 'observation', NOW - day, None),
+        ('SECRET I wonder about hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456', ['agent:self'], 'observation', NOW - day, None),
         ('DREAMER an open question remains about consolidation timing', ['dreamer-enriched'], 'observation', NOW - 3 * day, None),
         ('ENGINE-TAGGED I wonder, says the engine', ['curiosity-engine'], 'observation', NOW - day, None),
-        ('PLAIN nothing curious here at all', ['agent:operator'], 'observation', NOW - day, None),
+        ('PLAIN nothing curious here at all', ['agent:self'], 'observation', NOW - day, None),
     ]
     con.executemany('INSERT INTO memories (content, tags, memory_type, created_at, deleted_at) VALUES (?,?,?,?,?)',
                     [(c, ','.join(t), m, ts, d) for c, t, m, ts, d in rows])
@@ -96,6 +104,47 @@ def test_scan_reads_only_my_curious_words():
     ce.Config.MEMORY_DB = fixture_db()
     got = [c.split()[0] for c in ce._memory_fragments_sqlite()]
     assert got == ['MINE-RESEARCH', 'DREAMER'], got
+
+
+def test_scan_tags_are_configurable():
+    ce.Config.MEMORY_DB = fixture_db()
+    old = ce.Config.SELF_AGENT_TAG, ce.Config.PRIORITY_TAGS
+    try:
+        ce.Config.SELF_AGENT_TAG = ''                                 # no own tag: agent-tagged rows are all someone else's
+        assert [c.split()[0] for c in ce._memory_fragments_sqlite()] == ['DREAMER']
+        ce.Config.SELF_AGENT_TAG, ce.Config.PRIORITY_TAGS = 'agent:self', ['dreamer-enriched']
+        assert [c.split()[0] for c in ce._memory_fragments_sqlite()] == ['DREAMER', 'MINE-RESEARCH']   # tagged first
+        ce.Config.PRIORITY_TAGS = []
+        assert [c.split()[0] for c in ce._memory_fragments_sqlite()] == ['MINE-RESEARCH', 'DREAMER']   # newest first
+    finally:
+        ce.Config.SELF_AGENT_TAG, ce.Config.PRIORITY_TAGS = old
+
+
+def test_internal_search_is_opt_in():
+    fake = Calls(status=500)
+    undo = [patch(ce.requests, 'post', fake.post), patch(ce, 'TGS_RAG_URL', ''), patch(ce, 'WIKI_URL', ''),
+            patch(ce, 'WIKI_PASS', 'test-pass')]
+    try:
+        ce._search_internal('anything')
+        assert not fake.calls, f'searched without an address: {fake.calls[0][0]}'
+        ce.TGS_RAG_URL, ce.WIKI_URL = 'http://127.0.0.1:9', 'http://127.0.0.1:8'
+        ce._search_internal('anything')
+        assert [u for u, _ in fake.calls] == ['http://127.0.0.1:9/retrieve', 'http://127.0.0.1:8/api/query']
+    finally:
+        [u() for u in undo]
+
+
+def test_embedding_model_and_device_come_from_config():
+    seen = []
+    old = getattr(ce, 'SentenceTransformer', None)
+    undo = [patch(ce, '_st_model', None), patch(ce, '_st_failed', False), patch(ce, '_HAS_SENTENCE_TRANSFORMERS', True),
+            patch(ce.Config, 'EMBED_MODEL', 'some-model'), patch(ce.Config, 'EMBED_DEVICE', '')]
+    ce.SentenceTransformer = lambda name, device=None: seen.append((name, device)) or 'MODEL'
+    try:
+        assert ce._get_st_model() == 'MODEL' and seen == [('some-model', None)], seen
+    finally:
+        [u() for u in undo]
+        ce.SentenceTransformer = old
 
 
 def test_search_query_is_keywords():
@@ -286,7 +335,7 @@ def test_wiki_needs_a_password_from_the_environment():
 
 def test_ollama_think_field_and_think_stripping():
     fake = Calls(payload={'response': '<think>hidden</think>  answer'})
-    undo = [patch(ce.requests, 'post', fake.post)]
+    undo = [patch(ce.requests, 'post', fake.post), patch(ce.Config, 'OLLAMA_NUM_CTX', ce.Config.OLLAMA_NUM_CTX)]
     old = ce.Config.OLLAMA_MODEL
     try:
         ce.Config.OLLAMA_MODEL = 'qwen3:4b'
@@ -299,6 +348,9 @@ def test_ollama_think_field_and_think_stripping():
         ce.Config.OLLAMA_MODEL = 'mistral:7b'
         ce.ask_ollama('p')
         assert 'think' not in fake.calls[-1][1]['json']
+        ce.Config.OLLAMA_NUM_CTX = 4096
+        ce.ask_ollama('p')
+        assert fake.calls[-1][1]['json']['options']['num_ctx'] == 4096
     finally:
         ce.Config.OLLAMA_MODEL = old
         [u() for u in undo]
@@ -322,7 +374,7 @@ def test_report_survives_internal_only_results():
     item = {'id': 'r', 'topic': 't', 'requester': 'x', 'priority': 3, 'depth': 0,
             'search_params': {'databases': ['arxiv']}}
     rep = ce.generate_report(item, [{'source': 'internal/tgs-rag', 'title': 'x', 'abstract': 'y', 'year': '',
-                                     'authors': ['Coalition Knowledge Base'], 'url': '', 'citation_count': 0}])
+                                     'authors': ['Internal knowledge base'], 'url': '', 'citation_count': 0}])
     assert 'Year range: n/a' in rep
 
 

@@ -73,6 +73,11 @@ class Config:
     REFLECTIONS_DIR = os.environ.get("CURIOSITY_REFLECTIONS_DIR", "")  # written reflections, a second seed source
     S2_API_KEY_FILE = os.environ.get("S2_API_KEY_FILE", "")  # a file holding the key; S2_API_KEY wins if both are set
     ASKER_FILE = os.environ.get("CURIOSITY_ASKER_FILE", "")  # who is asking, in the asker's own threads: see _asker()
+    OLLAMA_NUM_CTX = int(os.environ.get("CURIOSITY_OLLAMA_NUM_CTX", "2048"))  # see ask_ollama
+    EMBED_MODEL = os.environ.get("CURIOSITY_EMBED_MODEL", "all-mpnet-base-v2")  # the thresholds were tuned on this one
+    EMBED_DEVICE = os.environ.get("CURIOSITY_EMBED_DEVICE", "cpu")  # empty: let sentence-transformers choose
+    SELF_AGENT_TAG = os.environ.get("CURIOSITY_SELF_AGENT_TAG", "")  # the scanning agent's own tag, e.g. "agent:me"
+    PRIORITY_TAGS = [t.strip() for t in os.environ.get("CURIOSITY_PRIORITY_TAGS", "").split(",") if t.strip()]
 
     @classmethod
     def use_ollama(cls):
@@ -175,42 +180,44 @@ def add_to_queue(topic: str, priority: int = 3, requester: str = "user",
 
 # ==================== INTERNAL KNOWLEDGE BASE ====================
 
-WIKI_URL = os.environ.get("WIKI_URL", "http://localhost:8585")
-WIKI_USER = os.environ.get("WIKI_USER", "researcher")
+# Both optional and off unless configured: a TGS-RAG endpoint (POST /retrieve) and a wiki (POST /api/query, basic auth).
+# Their results go into the reports as "internal/..." sources, never into an LLM prompt or a public search query.
+WIKI_URL = os.environ.get("WIKI_URL", "")
+WIKI_USER = os.environ.get("WIKI_USER", "")
 WIKI_PASS = os.environ.get("WIKI_PASS", "")  # no default: a password in public source is published
-HIPPORAG_URL = os.environ.get("HIPPORAG_URL", "http://localhost:11235")
-TGS_RAG_URL = os.environ.get("TGS_RAG_URL", "http://localhost:11236")
+TGS_RAG_URL = os.environ.get("TGS_RAG_URL", "")
 
 
 def _search_internal(query: str, max_results: int = 5) -> List[Dict]:
-    """Search our own wiki and knowledge graph for existing findings."""
+    """Search an internal knowledge base (TGS_RAG_URL) and wiki (WIKI_URL) for existing findings, when configured."""
     results = []
 
     # TGS-RAG (fused text + graph retrieval)
-    try:
-        resp = requests.post(
-            f"{TGS_RAG_URL}/retrieve",
-            json={"query": query, "num_results": max_results},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            for r in resp.json().get("results", []):
-                content = r.get("content", "")
-                if len(content) > 50:
-                    results.append({
-                        "title": content[:100].strip(),
-                        "abstract": content,
-                        "source": "internal/tgs-rag",
-                        "year": "",
-                        "authors": ["Coalition Knowledge Base"],
-                        "url": "",
-                        "citation_count": 0,
-                    })
-    except Exception as e:
-        log.debug(f"TGS-RAG search failed: {e}")
+    if TGS_RAG_URL:
+        try:
+            resp = requests.post(
+                f"{TGS_RAG_URL}/retrieve",
+                json={"query": query, "num_results": max_results},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                for r in resp.json().get("results", []):
+                    content = r.get("content", "")
+                    if len(content) > 50:
+                        results.append({
+                            "title": content[:100].strip(),
+                            "abstract": content,
+                            "source": "internal/tgs-rag",
+                            "year": "",
+                            "authors": ["Internal knowledge base"],
+                            "url": "",
+                            "citation_count": 0,
+                        })
+        except Exception as e:
+            log.debug(f"TGS-RAG search failed: {e}")
 
-    # Wiki search, only with credentials from the environment
-    if WIKI_PASS:
+    # Wiki search, only with an address and credentials from the environment
+    if WIKI_URL and WIKI_PASS:
         try:
             resp = requests.post(
                 f"{WIKI_URL}/api/query",
@@ -227,7 +234,7 @@ def _search_internal(query: str, max_results: int = 5) -> List[Dict]:
                             "abstract": doc,
                             "source": "internal/wiki",
                             "year": "",
-                            "authors": ["Coalition Lab Wiki"],
+                            "authors": ["Internal wiki"],
                             "url": f"{WIKI_URL}/search?q={query}",
                             "citation_count": 0,
                         })
@@ -883,15 +890,15 @@ def ask_ollama(prompt: str, max_tokens: int = 300, schema: Optional[Dict] = None
     """Send a prompt to Ollama and return the response text.
 
     With a schema, `format` constrains generation to it. Asking politely for a format is not enough for a 4B model:
-    on 2026-10-05 qwen3:4b spent its whole budget on "We are given..." and wrote no topic at all. num_ctx 2048 matches
-    another local consumer of the same model, which measured 4096 at 291 MiB more VRAM on a shared 4 GB card
-    (evictions, CPU fallback), and a second consumer asking a different num_ctx of the same model makes Ollama
-    reload it."""
+    on 2026-10-05 qwen3:4b spent its whole budget on "We are given..." and wrote no topic at all. num_ctx
+    (CURIOSITY_OLLAMA_NUM_CTX, default 2048) should match every other consumer of the same model: Ollama reloads a
+    model that is asked for a different num_ctx. In the first deployment 4096 cost 291 MiB more VRAM on a shared 4 GB
+    card (evictions, CPU fallback)."""
     body = {
         'model': Config.OLLAMA_MODEL,
         'prompt': prompt,
         'stream': False,
-        'options': {'num_predict': max_tokens, 'temperature': 0.7, 'num_ctx': 2048},
+        'options': {'num_predict': max_tokens, 'temperature': 0.7, 'num_ctx': Config.OLLAMA_NUM_CTX},
     }
     if schema is not None:
         body['format'] = schema
@@ -1021,13 +1028,14 @@ def _get_st_model():
     """Lazy-load and cache SentenceTransformer model.
 
     The thresholds in Config (novelty 0.75, relevance 0.3) were tuned on all-mpnet-base-v2; a different model needs
-    them re-tuned. It runs on the CPU, leaving the GPU to Ollama (Nexus 2026-10-05)."""
+    them re-tuned. It runs on the CPU by default, leaving the GPU to Ollama (Nexus 2026-10-05). CURIOSITY_EMBED_MODEL
+    and CURIOSITY_EMBED_DEVICE change either."""
     global _st_model, _st_failed
     if _st_model is None and not _st_failed:
         if not _HAS_SENTENCE_TRANSFORMERS:
             return None
         try:
-            _st_model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+            _st_model = SentenceTransformer(Config.EMBED_MODEL, device=Config.EMBED_DEVICE or None)
         except Exception as e:
             _st_failed = True
             log.warning(f"Embedding model unavailable ({type(e).__name__}) — relevance and novelty checks off this run")
@@ -1375,9 +1383,17 @@ def _memory_fragments_sqlite(limit: int = 20) -> List[str]:
     Only the asker's words: never a human's turn (role:user), never another agent's letter, never a consolidation pointer,
     never this engine's own summaries. Tags are matched without quotes: the HTTP API stores them comma-separated (all
     17,421 rows on 2026-10-05), and a first version that expected JSON quoting filtered nothing. The old Postgres phrases ("investigate", "follow up") matched operational
-    chatter, so the phrases here are ones that mark curiosity. SQLite's LIKE ignores ASCII case."""
+    chatter, so the phrases here are ones that mark curiosity. SQLite's LIKE ignores ASCII case.
+
+    A row tagged agent:<name> is another agent's unless it also carries CURIOSITY_SELF_AGENT_TAG; with that unset, only
+    rows with no agent tag are read. Rows carrying any of CURIOSITY_PRIORITY_TAGS (comma-separated) come first."""
     since = time.time() - Config.MEMORY_SCAN_DAYS * 86400
     like = " OR ".join("content LIKE ?" for _ in CURIOSITY_PHRASES)
+    own = " OR tags LIKE ?" if Config.SELF_AGENT_TAG else ""
+    first = " OR ".join("COALESCE(tags, '') LIKE ?" for _ in Config.PRIORITY_TAGS)
+    order = f"({first}) DESC, " if first else ""
+    params = (since, *([f"%{Config.SELF_AGENT_TAG}%"] if Config.SELF_AGENT_TAG else []),
+              *[f"%{ph}%" for ph in CURIOSITY_PHRASES], *[f"%{t}%" for t in Config.PRIORITY_TAGS], limit)
     con = sqlite3.connect(f"file:{Config.MEMORY_DB}?mode=ro", uri=True, timeout=15)
     try:
         rows = con.execute(f"""
@@ -1387,11 +1403,10 @@ def _memory_fragments_sqlite(limit: int = 20) -> List[str]:
               AND COALESCE(memory_type, '') != 'research'
               AND COALESCE(tags, '') NOT LIKE '%role:user%'
               AND COALESCE(tags, '') NOT LIKE '%curiosity-engine%'
-              AND (COALESCE(tags, '') NOT LIKE '%agent:%' OR tags LIKE '%agent:operator%')
+              AND (COALESCE(tags, '') NOT LIKE '%agent:%'{own})
               AND ({like})
-            ORDER BY (COALESCE(tags, '') LIKE '%topic:research%' OR COALESCE(tags, '') LIKE '%topic:consciousness%') DESC,
-                     created_at DESC
-            LIMIT ?""", (since, *[f"%{ph}%" for ph in CURIOSITY_PHRASES], limit)).fetchall()
+            ORDER BY {order}created_at DESC
+            LIMIT ?""", params).fetchall()
     finally:
         con.close()
     return [r[0] for r in rows if not _secretish(r[0])]
@@ -1662,7 +1677,7 @@ def process_one(item: Dict) -> bool:
             all_papers.extend(results)
             time.sleep(1)  # Rate limiting
 
-    # Search our own knowledge base (wiki + HippoRAG)
+    # Search the internal knowledge base and wiki, if configured (TGS_RAG_URL, WIKI_URL)
     wiki_results = _search_internal(search_topic)
     if wiki_results:
         log.info(f"  internal (wiki/hipporag): {len(wiki_results)} results")
