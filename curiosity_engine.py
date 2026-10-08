@@ -52,8 +52,15 @@ class Config:
     POSTGRES_URL = os.environ.get("DATABASE_URL", "")
     CLAUDE_CLI = os.environ.get("CLAUDE_CLI", "claude")
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "haiku")
+    LLM_BACKEND = os.environ.get("CURIOSITY_LLM", "claude")  # "claude" or "ollama"
+    OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+    OLLAMA_MODEL = os.environ.get("CURIOSITY_OLLAMA_MODEL", "mistral:7b")
     PID_FILE = os.environ.get("CURIOSITY_PID", "./data/runner.pid")
     OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
+
+    @classmethod
+    def use_ollama(cls):
+        return cls.LLM_BACKEND.lower() == "ollama"
 
     POLL_INTERVAL = 300  # 5 minutes
     MAX_PAPERS_PER_DB = 10
@@ -63,8 +70,10 @@ class Config:
     ENABLE_FOLLOWUPS = True
     FOLLOWUP_PRIORITY = 4  # Lower priority than manual requests
     MAX_FOLLOWUPS_PER_ITEM = 2
-    MAX_DEPTH = 3  # Stop branching after this many generations
+    MAX_DEPTH = 2  # Default branch cap (Lyra: exponential branching eats tokens)
+    MAX_DEPTH_NOVEL = 3  # Extended depth if thread finds genuinely novel papers
     NOVELTY_THRESHOLD = 0.75  # Cosine similarity cutoff — above this, skip as duplicate
+    RELEVANCE_THRESHOLD = 0.3  # Min similarity between paper abstract and query to include
     MIN_QUALITY_SCORE = 3  # Minimum papers to consider a thread worth following
 
     # Memory scanning for unresolved threads
@@ -143,6 +152,69 @@ def add_to_queue(topic: str, priority: int = 3, requester: str = "user",
     save_queue(queue)
     log.info(f"Queued: [{item_id}] '{topic}' (priority {priority}, by {requester})")
     return item_id
+
+
+# ==================== INTERNAL KNOWLEDGE BASE ====================
+
+WIKI_URL = os.environ.get("WIKI_URL", "http://localhost:8585")
+WIKI_USER = os.environ.get("WIKI_USER", "researcher")
+WIKI_PASS = os.environ.get("WIKI_PASS", "")  # no default: a password in public source is published
+HIPPORAG_URL = os.environ.get("HIPPORAG_URL", "http://localhost:11235")
+TGS_RAG_URL = os.environ.get("TGS_RAG_URL", "http://localhost:11236")
+
+
+def _search_internal(query: str, max_results: int = 5) -> List[Dict]:
+    """Search our own wiki and knowledge graph for existing findings."""
+    results = []
+
+    # TGS-RAG (fused text + graph retrieval)
+    try:
+        resp = requests.post(
+            f"{TGS_RAG_URL}/retrieve",
+            json={"query": query, "num_results": max_results},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            for r in resp.json().get("results", []):
+                content = r.get("content", "")
+                if len(content) > 50:
+                    results.append({
+                        "title": content[:100].strip(),
+                        "abstract": content,
+                        "source": "internal/tgs-rag",
+                        "year": "",
+                        "authors": ["Coalition Knowledge Base"],
+                        "url": "",
+                        "citation_count": 0,
+                    })
+    except Exception as e:
+        log.debug(f"TGS-RAG search failed: {e}")
+
+    # Wiki search
+    try:
+        resp = requests.post(
+            f"{WIKI_URL}/api/query",
+            json={"query": query, "num": max_results},
+            auth=(WIKI_USER, WIKI_PASS),
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for doc in data.get("docs", [])[:max_results]:
+                if isinstance(doc, str) and len(doc) > 50:
+                    results.append({
+                        "title": doc[:100].strip(),
+                        "abstract": doc,
+                        "source": "internal/wiki",
+                        "year": "",
+                        "authors": ["Coalition Lab Wiki"],
+                        "url": f"{WIKI_URL}/search?q={query}",
+                        "citation_count": 0,
+                    })
+    except Exception as e:
+        log.debug(f"Wiki search failed: {e}")
+
+    return results
 
 
 # ==================== API CLIENTS ====================
@@ -332,6 +404,67 @@ def deduplicate(papers: List[Dict]) -> List[Dict]:
     return unique
 
 
+def relevance_gate(papers: List[Dict], query: str) -> List[Dict]:
+    """Filter papers by cosine similarity between abstract and query.
+
+    Lyra's suggestion: before including a paper, check that its abstract
+    is actually relevant to the thread question. Papers below threshold
+    get dropped rather than diluting the report.
+    """
+    model = _get_st_model()
+    if model is None or not papers:
+        return papers
+
+    try:
+        query_emb = model.encode(query)
+        scored = []
+        for p in papers:
+            abstract = p.get("abstract", "")
+            if not abstract:
+                scored.append((p, 0.5))  # No abstract = benefit of doubt
+                continue
+            paper_emb = model.encode(abstract[:500])
+            dot = sum(a * b for a, b in zip(query_emb, paper_emb))
+            norm_a = sum(a * a for a in query_emb) ** 0.5
+            norm_b = sum(b * b for b in paper_emb) ** 0.5
+            sim = dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
+            scored.append((p, sim))
+
+        relevant = [(p, s) for p, s in scored if s >= Config.RELEVANCE_THRESHOLD]
+        filtered = len(papers) - len(relevant)
+        if filtered > 0:
+            log.info(f"  Relevance gate: kept {len(relevant)}/{len(papers)} papers (filtered {filtered} below {Config.RELEVANCE_THRESHOLD})")
+        return [p for p, s in relevant]
+    except Exception as e:
+        log.warning(f"Relevance gating failed (keeping all): {e}")
+        return papers
+
+
+def extract_parent_terms(item: Dict) -> List[str]:
+    """Extract key terms from parent topic for search narrowing at depth.
+
+    Lyra's suggestion: child queries should inherit mandatory terms from
+    the parent thread to prevent search dilution at depth.
+    """
+    parent_id = item.get("parent_id")
+    if not parent_id:
+        return []
+
+    queue = load_queue()
+    parent = next((q for q in queue if q["id"] == parent_id), None)
+    if not parent:
+        return []
+
+    parent_topic = parent.get("topic", "")
+    stop_words = {"the", "a", "an", "in", "on", "of", "for", "and", "or", "to", "is",
+                  "are", "was", "were", "how", "what", "why", "does", "do", "can", "with"}
+    terms = [w for w in re.findall(r'\b[a-zA-Z]{3,}\b', parent_topic)
+             if w.lower() not in stop_words]
+    # Keep the most distinctive terms (longer words, likely technical)
+    terms.sort(key=len, reverse=True)
+    return terms[:3]
+
+
 # ==================== REPORT GENERATION ====================
 
 def generate_report(item: Dict, papers: List[Dict]) -> str:
@@ -360,10 +493,10 @@ def generate_report(item: Dict, papers: List[Dict]) -> str:
         return "\n".join(lines)
 
     # Sort by citations (descending), nulls last
-    papers.sort(key=lambda p: (p["citations"] or 0), reverse=True)
+    papers.sort(key=lambda p: (p.get("citations") or p.get("citation_count") or 0), reverse=True)
 
     for i, p in enumerate(papers, 1):
-        cites = f" | Cited by: {p['citations']}" if p['citations'] else ""
+        cites = f" | Cited by: {p.get('citations', p.get('citation_count', 0))}" if p.get('citations', p.get('citation_count')) else ""
         lines.extend([
             f"## {i}. {p['title']}",
             f"**Authors**: {', '.join(p['authors'])}  ",
@@ -387,7 +520,80 @@ def generate_report(item: Dict, papers: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def generate_digest(item: Dict, papers: List[Dict]) -> str:
+    """Token-optimized DNO digest for agent consumption."""
+    depth = item.get('depth', 0)
+    lines = [
+        f"CE|{item['id']}|d={depth}|n={len(papers)}|{item['topic'][:80]}",
+        "---",
+    ]
+    papers.sort(key=lambda p: (p.get("citations") or p.get("citation_count") or 0), reverse=True)
+    for p in papers:
+        src = p.get("source", "?")
+        yr = p.get("year", "?")
+        cites = p.get("citations") or p.get("citation_count") or 0
+        title = p.get("title", "?")[:100]
+        if src in ("internal/tgs-rag", "internal/wiki"):
+            lines.append(f"INT|{title}")
+        else:
+            lines.append(f"{src}|{yr}|c={cites}|{title}")
+    return "\n".join(lines) + "\n"
+
+
 # ==================== MEMORY STORAGE ====================
+
+def _ingest_to_graph(papers: List[Dict]):
+    """Index discovered papers into the federated knowledge graph (HippoRAG)."""
+    hipporag_url = os.environ.get("HIPPORAG_URL", "http://localhost:11235")
+
+    # Filter to external papers only (skip internal/wiki results)
+    external = [p for p in papers
+                if p.get("source", "") not in ("internal/tgs-rag", "internal/wiki", "")]
+    if not external:
+        return
+
+    docs = []
+    for p in external:
+        parts = [f"Research paper: {p.get('title', 'Untitled')}"]
+        authors = p.get("authors", [])
+        if authors:
+            if isinstance(authors[0], dict):
+                names = [a.get("name", "") for a in authors[:5]]
+            else:
+                names = [str(a) for a in authors[:5]]
+            parts.append(f"Authors: {', '.join(names)}")
+        if p.get("year"):
+            parts.append(f"Year: {p['year']}")
+        if p.get("venue"):
+            parts.append(f"Venue: {p['venue']}")
+        if p.get("citations"):
+            parts.append(f"Citations: {p['citations']}")
+        url = p.get("url", p.get("arxiv_url", ""))
+        if url:
+            parts.append(f"URL: {url}")
+        if p.get("abstract"):
+            parts.append(f"Abstract: {p['abstract'][:1000]}")
+        parts.append("Source: curiosity-engine")
+        docs.append("\n".join(parts))
+
+    if not docs:
+        return
+
+    try:
+        resp = requests.post(
+            f"{hipporag_url}/index",
+            json={"docs": docs},
+            timeout=120,
+        )
+        if resp.status_code == 200:
+            count = resp.json().get("count", 0)
+            if count:
+                log.info(f"  Indexed {count} papers into federated graph")
+        else:
+            log.warning(f"  Graph indexing failed: HTTP {resp.status_code}")
+    except Exception as e:
+        log.debug(f"  Graph indexing skipped: {e}")
+
 
 def store_in_memory(item: Dict, papers: List[Dict]):
     """Store research summary in PostgreSQL memory (if configured)."""
@@ -518,31 +724,28 @@ def check_idea_file():
 
 # ==================== CURIOSITY ENGINE ====================
 
-def generate_followups(item: Dict, papers: List[Dict]) -> List[str]:
-    """Use LLM via Claude CLI to generate follow-up research questions."""
-    if not Config.ENABLE_FOLLOWUPS or not papers:
-        return []
+def ask_ollama(prompt: str, max_tokens: int = 300) -> Optional[str]:
+    """Send a prompt to Ollama and return the response text."""
+    try:
+        resp = requests.post(
+            f'{Config.OLLAMA_URL}/api/generate',
+            json={
+                'model': Config.OLLAMA_MODEL,
+                'prompt': prompt,
+                'stream': False,
+                'options': {'num_predict': max_tokens, 'temperature': 0.7},
+            },
+            timeout=90,
+        )
+        if resp.status_code == 200:
+            return resp.json().get('response', '').strip()
+    except Exception as e:
+        log.warning(f"Ollama error: {e}")
+    return None
 
-    # Build context from top 5 papers
-    paper_summaries = []
-    for p in papers[:5]:
-        cite_str = f" ({p['citations']} citations)" if p.get('citations') else ""
-        paper_summaries.append(f"- {p['title']} ({p['year']}){cite_str}: {p['abstract'][:200]}")
 
-    prompt = f"""You are a research assistant. Given a research topic and its results, generate follow-up questions.
-
-Topic: "{item['topic']}"
-
-Top papers found:
-{chr(10).join(paper_summaries)}
-
-Based on gaps, tensions, or unexplored angles in these results, suggest exactly {Config.MAX_FOLLOWUPS_PER_ITEM} follow-up research questions. Each should be:
-- Specific enough to be a good academic database search query (30-80 characters ideal)
-- Different from the original topic
-- Focused on an underexplored connection or open question
-
-Reply with ONLY the questions, one per line, no numbering, bullets, or commentary."""
-
+def ask_claude(prompt: str) -> Optional[str]:
+    """Send a prompt to Claude CLI and return the response text."""
     try:
         result = subprocess.run(
             [Config.CLAUDE_CLI, "-p", "--model", Config.CLAUDE_MODEL,
@@ -552,32 +755,80 @@ Reply with ONLY the questions, one per line, no numbering, bullets, or commentar
         )
         if result.returncode != 0:
             log.warning(f"Claude CLI failed: {result.stderr[:200]}")
-            return []
-
-        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-        # Filter out non-questions (LLM refusals, meta-commentary, etc.)
-        reject_patterns = ["I'm Claude", "I am Claude", "I appreciate", "I need to clarify",
-                           "I should note", "doesn't apply", "I can help", "as an AI"]
-        followups = []
-        for line in lines:
-            if len(line) < 15 or len(line) > 300:
-                continue
-            if any(pat.lower() in line.lower() for pat in reject_patterns):
-                continue
-            followups.append(line)
-        followups = followups[:Config.MAX_FOLLOWUPS_PER_ITEM]
-        if followups:
-            log.info(f"  Curiosity generated {len(followups)} follow-ups")
-        return followups
+            return None
+        return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        log.warning("Claude CLI timed out for follow-up generation")
-        return []
+        log.warning("Claude CLI timed out")
+        return None
     except FileNotFoundError:
-        log.warning("Claude CLI not found — follow-ups disabled")
-        return []
+        log.warning("Claude CLI not found")
+        return None
     except Exception as e:
-        log.warning(f"Follow-up generation failed: {e}")
+        log.warning(f"Claude CLI failed: {e}")
+        return None
+
+
+def ask_llm(prompt: str, max_tokens: int = 300) -> Optional[str]:
+    """Route prompt to configured LLM backend."""
+    if Config.use_ollama():
+        return ask_ollama(prompt, max_tokens)
+    return ask_claude(prompt)
+
+
+def generate_followups(item: Dict, papers: List[Dict]) -> List[str]:
+    """Use LLM to generate follow-up research questions."""
+    if not Config.ENABLE_FOLLOWUPS or not papers:
         return []
+
+    # Build context from top 5 papers
+    paper_summaries = []
+    for p in papers[:5]:
+        cite_str = f" ({p['citations']} citations)" if p.get('citations') else ""
+        paper_summaries.append(f"- {p['title']} ({p['year']}){cite_str}: {p['abstract'][:200]}")
+
+    # Include parent context for depth-aware follow-up generation
+    parent_context = ""
+    parent_terms = extract_parent_terms(item)
+    if parent_terms:
+        parent_context = f"\nParent thread terms (must be relevant to these): {', '.join(parent_terms)}\n"
+
+    prompt = f"""You are a research assistant. Given a research topic and its results, generate follow-up questions.
+
+Topic: "{item['topic']}"{parent_context}
+
+Top papers found:
+{chr(10).join(paper_summaries)}
+
+Based on gaps, tensions, or unexplored angles in these results, suggest exactly {Config.MAX_FOLLOWUPS_PER_ITEM} follow-up research questions. Each should be:
+- Specific enough to be a good academic database search query (30-80 characters ideal)
+- Different from the original topic
+- Focused on an underexplored connection or open question{f'{chr(10)}- Related to the parent thread terms: {", ".join(parent_terms)}' if parent_terms else ''}
+
+Reply with ONLY the questions, one per line, no numbering, bullets, or commentary."""
+
+    raw = ask_llm(prompt)
+    if not raw:
+        return []
+
+    lines = [l.strip() for l in raw.split('\n') if l.strip()]
+    # Strip numbering, bullets, quotes
+    lines = [re.sub(r'^[\d]+[\.\)]\s*', '', l) for l in lines]
+    lines = [re.sub(r'^[-*•]\s*', '', l) for l in lines]
+    lines = [l.strip('"\'') for l in lines]
+    reject_patterns = ["I'm Claude", "I am Claude", "I appreciate", "I need to clarify",
+                       "I should note", "doesn't apply", "I can help", "as an AI",
+                       "I'm Qwen", "I am Qwen", "I'm Mistral", "I am Mistral"]
+    followups = []
+    for line in lines:
+        if len(line) < 15 or len(line) > 300:
+            continue
+        if any(pat.lower() in line.lower() for pat in reject_patterns):
+            continue
+        followups.append(line)
+    followups = followups[:Config.MAX_FOLLOWUPS_PER_ITEM]
+    if followups:
+        log.info(f"  Curiosity generated {len(followups)} follow-ups")
+    return followups
 
 
 _st_model = None
@@ -622,13 +873,59 @@ def is_semantically_duplicate(new_topic: str, queue: List[Dict]) -> bool:
 
 
 def queue_followups(followups: List[str], parent_item: Dict):
-    """Add generated follow-up questions to the research queue."""
+    """Add generated follow-up questions to the research queue.
+
+    Lyra's suggestion 3: depth budget capped at 2 by default, extended to 3
+    only if the thread found papers not seen in any ancestor thread (novelty).
+    """
     parent_depth = parent_item.get("depth", 0)
 
-    # Depth cap — stop branching when curiosity is satisfied
-    if parent_depth >= Config.MAX_DEPTH:
-        log.info(f"  Depth {parent_depth} >= max {Config.MAX_DEPTH} — branch complete")
-        return
+    # Depth cap with novelty extension
+    max_depth = Config.MAX_DEPTH
+    if parent_depth >= max_depth:
+        # Check if this thread found novel papers worth pursuing deeper
+        result_file = parent_item.get("result_file", "")
+        if result_file and parent_depth < Config.MAX_DEPTH_NOVEL:
+            queue = load_queue()
+            ancestor_files = []
+            pid = parent_item.get("parent_id")
+            while pid:
+                ancestor = next((q for q in queue if q["id"] == pid), None)
+                if ancestor:
+                    if ancestor.get("result_file"):
+                        ancestor_files.append(ancestor["result_file"])
+                    pid = ancestor.get("parent_id")
+                else:
+                    break
+
+            if ancestor_files:
+                try:
+                    current_titles = set()
+                    with open(result_file) as f:
+                        for line in f:
+                            if line.startswith("## ") and not line.startswith("## Follow"):
+                                current_titles.add(line.strip().lower())
+
+                    ancestor_titles = set()
+                    for af in ancestor_files:
+                        try:
+                            with open(af) as f:
+                                for line in f:
+                                    if line.startswith("## ") and not line.startswith("## Follow"):
+                                        ancestor_titles.add(line.strip().lower())
+                        except FileNotFoundError:
+                            pass
+
+                    novel = current_titles - ancestor_titles
+                    if len(novel) >= 3:
+                        log.info(f"  Novelty extension: {len(novel)} papers not in ancestors — allowing depth {parent_depth + 1}")
+                        max_depth = Config.MAX_DEPTH_NOVEL
+                except Exception:
+                    pass
+
+        if parent_depth >= max_depth:
+            log.info(f"  Depth {parent_depth} >= max {max_depth} — branch complete")
+            return
 
     for topic in followups:
         if len(topic) < 10:
@@ -707,17 +1004,12 @@ Extract up to {Config.MEMORY_SCAN_LIMIT} concrete research topics from these fra
 Reply with ONLY the topics, one per line, no numbering or bullets. If nothing is worth pursuing, reply with just "NONE"."""
 
         try:
-            result = subprocess.run(
-                [Config.CLAUDE_CLI, "-p", "--model", Config.CLAUDE_MODEL,
-                 "--no-session-persistence", "--tools", ""],
-                input=prompt, capture_output=True, timeout=60,
-                encoding='utf-8', errors='replace'
-            )
-            if result.returncode != 0 or "NONE" in result.stdout.strip():
+            raw = ask_llm(prompt)
+            if not raw or "NONE" in raw:
                 log.info("  No actionable threads extracted from memory")
                 return
 
-            topics = [l.strip() for l in result.stdout.strip().split('\n')
+            topics = [l.strip() for l in raw.split('\n')
                       if l.strip() and len(l.strip()) > 10]
 
             queue = load_queue()
@@ -747,8 +1039,17 @@ def process_one(item: Dict) -> bool:
     params = item.get("search_params", {})
     databases = params.get("databases", ["arxiv", "s2", "openalex", "pubmed"])
     max_per_db = params.get("max_papers", Config.MAX_PAPERS_PER_DB)
+    depth = item.get("depth", 0)
 
-    log.info(f"Processing [{item['id']}]: '{topic}'")
+    # Lyra's suggestion 1: inherit parent terms at depth to narrow search
+    parent_terms = extract_parent_terms(item)
+    search_topic = topic
+    if parent_terms and depth > 0:
+        search_topic = f"{topic} {' '.join(parent_terms)}"
+        log.info(f"  Depth {depth}: narrowing search with parent terms: {parent_terms}")
+
+    log.info(f"Processing [{item['id']}]: '{topic}'" +
+             (f" (search: '{search_topic}')" if search_topic != topic else ""))
 
     all_papers = []
     search_fns = {
@@ -762,13 +1063,22 @@ def process_one(item: Dict) -> bool:
         fn = search_fns.get(db)
         if fn:
             log.info(f"  Searching {db}...")
-            results = fn(topic, max_per_db)
+            results = fn(search_topic, max_per_db)
             log.info(f"  {db}: {len(results)} results")
             all_papers.extend(results)
             time.sleep(1)  # Rate limiting
 
+    # Search our own knowledge base (wiki + HippoRAG)
+    wiki_results = _search_internal(search_topic)
+    if wiki_results:
+        log.info(f"  internal (wiki/hipporag): {len(wiki_results)} results")
+        all_papers.extend(wiki_results)
+
     papers = deduplicate(all_papers)
     log.info(f"  Total unique papers: {len(papers)}")
+
+    # Lyra's suggestion 2: relevance gating
+    papers = relevance_gate(papers, topic)
 
     # Generate report — organized into date-based folders
     report = generate_report(item, papers)
@@ -782,7 +1092,16 @@ def process_one(item: Dict) -> bool:
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(report)
 
+    # Compact DNO digest — token-optimized for agent consumption
+    digest = generate_digest(item, papers)
+    dno_path = os.path.join(output_dir, f"{item['id']}_{slug}.dno")
+    with open(dno_path, 'w', encoding='utf-8') as f:
+        f.write(digest)
+
     log.info(f"  Report written: {filepath}")
+
+    # Index discovered papers into the federated knowledge graph
+    _ingest_to_graph(papers)
 
     # Store in memory
     store_in_memory(item, papers)
