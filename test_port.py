@@ -151,6 +151,48 @@ def test_s2_sends_the_key_and_backs_off_exponentially():
         [u() for u in undo]
 
 
+def test_digest_entry_comes_back_labelled_and_external_only():
+    fake = Calls(reply='{"finding": "FINDING-TEXT", "open": "OPEN-TEXT"}')
+    undo = [patch(ce, 'ask_llm', fake.llm)]
+    try:
+        item = {'id': 'd1', 'topic': 'TOPIC-X', 'requester': 'memory_scan', 'depth': 0}
+        papers = [{'source': 'internal/tgs-rag', 'title': 'MEMORY-TEXT', 'abstract': 'MEMORY-TEXT', 'year': ''},
+                  {'source': 'arxiv', 'title': 'Paper A', 'abstract': 'abs A', 'year': '2025', 'url': 'http://a'},
+                  {'source': 'openalex', 'title': 'Paper B', 'abstract': 'abs B', 'year': '2024', 'url': 'http://b'}]
+        ce.append_daily_digest(item, papers, 'out/r.md')
+        day = ce.datetime.now().strftime('%Y-%m-%d')
+        text = open(f'{TMP}/out/digest/{day}.md').read()
+        for want in ('TOPIC-X', 'FINDING-TEXT', 'unverified', 'OPEN-TEXT', 'Paper A', 'Paper B', 'arxiv 1, openalex 1'):
+            assert want in text, want
+        assert 'MEMORY-TEXT' not in text and 'MEMORY-TEXT' not in fake.calls[0], 'internal text reached the digest'
+        assert fake.kw.get('schema') is ce.DIGEST_SCHEMA
+        n = len(open(f'{TMP}/out/digest/{day}.md').read())
+        ce.append_daily_digest(item, papers[:1], 'out/r.md')            # internal only: nothing to say
+        assert len(open(f'{TMP}/out/digest/{day}.md').read()) == n
+    finally:
+        [u() for u in undo]
+
+
+def test_reflection_fragments_take_one_real_question_each():
+    d = f'{TMP}/refl'
+    os.makedirs(d, exist_ok=True)
+    files = {'001_a.md': 'A long statement that is not a question at all. Does attention really carry the position it seems to carry here?',
+             '002_b.md': 'Short one? What about hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 in this question, does it leak?',
+             '003_c.md': 'Only conclusions here. Nothing is asked in this one, only told to the reader plainly.'}
+    for i, (n, t) in enumerate(files.items()):
+        with open(f'{d}/{n}', 'w') as f:
+            f.write(t)
+        os.utime(f'{d}/{n}', (NOW - 100 * i, NOW - 100 * i))
+    old = ce.Config.REFLECTIONS_DIR
+    try:
+        ce.Config.REFLECTIONS_DIR = d
+        assert ce._reflection_fragments() == ['Does attention really carry the position it seems to carry here?']
+        ce.Config.REFLECTIONS_DIR = f'{TMP}/absent'
+        assert ce._reflection_fragments() == []
+    finally:
+        ce.Config.REFLECTIONS_DIR = old
+
+
 def test_external_query_filter():
     ce._private_terms = None
     ok = lambda t, **kw: ce.safe_external_query(t, **kw)[0]

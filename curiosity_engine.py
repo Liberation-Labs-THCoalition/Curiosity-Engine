@@ -17,7 +17,7 @@ Version: 2.0.0
 License: MIT
 """
 
-import json, os, sys, time, uuid, logging, re, hashlib, subprocess, sqlite3, fcntl, difflib, random
+import json, os, sys, time, uuid, logging, re, hashlib, subprocess, sqlite3, fcntl, difflib, random, collections
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -70,6 +70,7 @@ class Config:
     ITEMS_PER_RUN = int(os.environ.get("CURIOSITY_ITEMS_PER_RUN", "1"))
     STUCK_AFTER_S = 6 * 3600  # an in_progress item older than this died with its run
     MAX_ATTEMPTS = 2
+    REFLECTIONS_DIR = os.environ.get("CURIOSITY_REFLECTIONS_DIR", "")  # written reflections, a second seed source
     S2_API_KEY_FILE = os.environ.get("S2_API_KEY_FILE", "")  # a file holding the key; S2_API_KEY wins if both are set
 
     @classmethod
@@ -602,6 +603,57 @@ def generate_digest(item: Dict, papers: List[Dict]) -> str:
         else:
             lines.append(f"{src}|{yr}|c={cites}|{title}")
     return "\n".join(lines) + "\n"
+
+
+DIGEST_SCHEMA = {"type": "object", "required": ["finding", "open"],
+                 "properties": {"finding": {"type": "string"}, "open": {"type": "string"}}}
+
+
+def append_daily_digest(item: Dict, papers: List[Dict], report_path: str):
+    """One short entry per explored question in output/digest/<date>.md (Nexus 2026-10-05).
+
+    The reports piled up where nobody read them; curiosity that never comes back to the one who is curious is a
+    crawler, so point the asker at this file (an agent's session-start hook, say). The finding is the local model's
+    reading of the abstracts, labelled as such and kept out of memory: a small model's paraphrase is not something the
+    asker learned."""
+    external = [p for p in papers if not str(p.get("source", "")).startswith("internal/")]
+    if not external:
+        return
+    abstracts = "\n".join(f"{i}. {p['title']} ({p.get('year') or 'n.d.'}): {(p.get('abstract') or '')[:400]}"
+                          for i, p in enumerate(external[:5], 1))
+    prompt = f"""Research question: "{item['topic']}"
+
+Abstracts of the papers found:
+{abstracts}
+
+Using ONLY these abstracts: in at most two sentences, what do they say about the question? If they do not address it, say so plainly. Then, in one sentence, what remains open.
+Reply with JSON only, in the form {{"finding": "...", "open": "..."}}."""
+    finding = still_open = ""
+    raw = ask_llm(prompt, max_tokens=300, schema=DIGEST_SCHEMA)
+    if raw:
+        try:
+            obj = json.loads(raw[raw.index('{'):raw.rindex('}') + 1])
+            finding, still_open = str(obj.get("finding", "")).strip(), str(obj.get("open", "")).strip()
+        except ValueError:
+            pass
+    sources = ", ".join(f"{src} {n}" for src, n in sorted(collections.Counter(p['source'] for p in external).items()))
+    lines = [f"## {datetime.now().strftime('%H:%M')} · {item['topic']}",
+             f"*{len(external)} papers ({sources}) · depth {item.get('depth', 0)} · from {item.get('requester')} · "
+             f"report: `{report_path}`*", ""]
+    if finding:
+        lines.append(f"- **Finding** (the local model's reading of the abstracts, unverified): {finding}")
+    if still_open:
+        lines.append(f"- **Still open:** {still_open}")
+    for p in external[:3]:
+        lines.append(f"- {p['title']} ({p.get('year') or 'n.d.'}, {p['source']}) {p.get('url') or ''}".rstrip())
+    day = datetime.now().strftime("%Y-%m-%d")
+    path = os.path.join(Config.OUTPUT_DIR, "digest", f"{day}.md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    new = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as f:
+        if new:
+            f.write(f"# Curiosity digest, {day}\n\n")
+        f.write("\n".join(lines) + "\n\n")
 
 
 # ==================== MEMORY STORAGE ====================
@@ -1206,6 +1258,33 @@ def _memory_fragments_sqlite(limit: int = 20) -> List[str]:
     return [r[0] for r in rows if not _secretish(r[0])]
 
 
+def _reflection_fragments(limit: int = 4) -> List[str]:
+    """One open question from each of the asker's newest written reflections, at most `limit`: the place an agent
+    writes down the questions it means. (On 2026-10-05 the eight newest reflections in the first deployment held three
+    questions between them.)"""
+    d = Config.REFLECTIONS_DIR
+    if not d or not os.path.isdir(d):
+        return []
+    names = sorted((n for n in os.listdir(d) if n.endswith('.md')),
+                   key=lambda n: os.path.getmtime(os.path.join(d, n)), reverse=True)[:8]
+    marks = [ph.lower() for ph in CURIOSITY_PHRASES] + ["i don't know whether", "i don't know what"]
+    out = []
+    for name in names:
+        try:
+            with open(os.path.join(d, name), encoding='utf-8') as f:
+                text = re.sub(r'\s+', ' ', f.read())
+        except OSError:
+            continue
+        for sent in re.split(r'(?<=[.?!])\s+', text):
+            if 40 <= len(sent) <= 300 and (sent.endswith('?') or any(m in sent.lower() for m in marks)) \
+                    and not _secretish(sent):
+                out.append(sent)
+                break  # one per reflection: breadth over depth
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _memory_fragments_pg() -> List[str]:
     conn = psycopg2.connect(Config.POSTGRES_URL)
     cur = conn.cursor()
@@ -1248,16 +1327,17 @@ def scan_memories_for_threads():
     _save_state(state)
 
     log.info("Scanning memories for unresolved research threads...")
-    stats = {"fragments": 0, "topics": 0, "rejected": 0, "queued": 0}
+    stats = {"fragments": 0, "reflections": 0, "topics": 0, "rejected": 0, "queued": 0}
     try:
         rows = _memory_fragments_pg() if use_pg else _memory_fragments_sqlite()
-        stats["fragments"] = len(rows)
-        if not rows:
+        refl = _reflection_fragments()
+        stats["fragments"], stats["reflections"] = len(rows), len(refl)
+        if not rows and not refl:
             log.info("  No unresolved threads found in memory")
             return
 
-        # Use LLM to extract research-worthy questions from memory fragments
-        fragments = "\n".join(f"- {row[:300]}" for row in rows[:10])
+        # Use LLM to extract research-worthy questions; reflections take up to 4 of the 10 places
+        fragments = "\n".join(f"- {row[:300]}" for row in rows[:10 - len(refl)] + refl)
         prompt = f"""These are memory fragments from previous thinking that contain unresolved questions or threads:
 
 {fragments}
@@ -1292,7 +1372,7 @@ Reply with JSON only, in the form {{"topics": ["...", "..."]}}. If nothing is wo
             existing.add(topic.lower())
             queue = load_queue()
             stats["queued"] += 1
-        log.info(f"  Memory scan: {stats['fragments']} fragments, {stats['topics']} topics, "
+        log.info(f"  Memory scan: {stats['fragments']} fragments, {stats['reflections']} reflections, {stats['topics']} topics, "
                  f"{stats['rejected']} rejected, {stats['queued']} queued")
     except Exception as e:
         log.warning(f"Memory scan failed: {type(e).__name__}: {e}")
@@ -1450,6 +1530,7 @@ def process_one(item: Dict) -> bool:
         f.write(digest)
 
     log.info(f"  Report written: {filepath}")
+    append_daily_digest(item, papers, filepath)
 
     # Index discovered papers into the federated knowledge graph
     _ingest_to_graph(papers)
