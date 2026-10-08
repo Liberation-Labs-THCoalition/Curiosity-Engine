@@ -72,6 +72,7 @@ class Config:
     MAX_ATTEMPTS = 2
     REFLECTIONS_DIR = os.environ.get("CURIOSITY_REFLECTIONS_DIR", "")  # written reflections, a second seed source
     S2_API_KEY_FILE = os.environ.get("S2_API_KEY_FILE", "")  # a file holding the key; S2_API_KEY wins if both are set
+    ASKER_FILE = os.environ.get("CURIOSITY_ASKER_FILE", "")  # who is asking, in the asker's own threads: see _asker()
 
     @classmethod
     def use_ollama(cls):
@@ -961,9 +962,17 @@ def generate_followups(item: Dict, papers: List[Dict]) -> List[str]:
     parent_terms = extract_parent_terms(item)
     if parent_terms:
         parent_context = f"\nParent thread terms (must be relevant to these): {', '.join(parent_terms)}\n"
+    # A thread the asker began keeps its asker: who is asking, and the question it began with
+    mine, root = _thread_is_mine(item)
+    asker = _asker_block() if mine else ""
+    if asker and root and root.get("id") != item.get("id"):
+        asker += f'The question this thread began with: "{root["topic"]}"\n'
+    rules = f"\n- Related to the parent thread terms: {', '.join(parent_terms)}" if parent_terms else ""
+    if asker:
+        rules += f"\n- {ASKER_RULE}"
 
     prompt = f"""You are a research assistant. Given a research topic and its results, generate follow-up questions.
-
+{asker}
 Topic: "{item['topic']}"{parent_context}
 
 Top papers found:
@@ -972,7 +981,7 @@ Top papers found:
 Based on gaps, tensions, or unexplored angles in these results, suggest exactly {Config.MAX_FOLLOWUPS_PER_ITEM} follow-up research questions. Each should be:
 - Specific enough to be a good academic database search query (30-80 characters ideal)
 - Different from the original topic
-- Focused on an underexplored connection or open question{f'{chr(10)}- Related to the parent thread terms: {", ".join(parent_terms)}' if parent_terms else ''}
+- Focused on an underexplored connection or open question{rules}
 
 Reply with JSON only, in the form {{"topics": ["...", "..."]}}."""
 
@@ -993,6 +1002,10 @@ Reply with JSON only, in the form {{"topics": ["...", "..."]}}."""
         ok, why = safe_external_query(line)
         if not ok:
             log.info(f"  Follow-up rejected before any external search ({why})")
+            continue
+        fit = asker_fit(line) if mine else None
+        if fit is not None and fit < 0:
+            log.info(f"  Follow-up off the asker's fields (margin {fit:+.2f}): {line[:70]}")
             continue
         followups.append(line)
     followups = followups[:Config.MAX_FOLLOWUPS_PER_ITEM]
@@ -1126,6 +1139,132 @@ def queue_followups(followups: List[str], parent_item: Dict):
                 depth=parent_depth + 1,
                 parent_id=parent_item["id"]
             )
+
+
+# ==================== WHO IS ASKING ====================
+# Nexus 2026-10-05. In its first deployment the engine read an agent's own notes and found the question the agent kept
+# circling: what a context compaction does to it. It asked instead how "memory compaction in distributed systems
+# affects temporal coherence", and two follow-ups later it was researching compaction in event cameras. It kept the
+# word and lost the asker. The asker file is markdown:
+# prose, then "## Fields", "## Not these" and "## Requesters" lists. It says who is asking and what its words mean. In a
+# thread the asker began (a memory scan's, or a named requester's), its prose goes into the prompts that write topics,
+# and the topics the engine writes are gated on its lists. A thread somebody else started is theirs: no asker text, no
+# gate. With no file, nothing changes.
+
+MACHINE_REQUESTERS = ("memory_scan", "curiosity_engine")
+ASKER_RULE = "In the asker's sense of its words, and within its fields"
+_ABBREVIATIONS = [(r"\bLLMs\b", "large language models"), (r"\bLLM\b", "large language model"),
+                  (r"\bKV\b", "key-value"), (r"\bRL\b", "reinforcement learning"), (r"\bMoE\b", "mixture-of-experts"),
+                  (r"\bRAG\b", "retrieval-augmented generation"), (r"\bGNNs?\b", "graph neural network"),
+                  (r"\bTTS\b", "text-to-speech")]
+_asker_cache = None
+_asker_emb = None
+
+
+def _asker() -> Dict:
+    """{"profile": prose, "fields": [...], "not": [...], "requesters": [...]} from Config.ASKER_FILE; all empty
+    without one. "## Requesters" names the queue requesters that are the asker: a thread whose first question came
+    from one of them is the asker's, as is every thread a memory scan began."""
+    global _asker_cache
+    if _asker_cache is None:
+        a, text = {"profile": "", "fields": [], "not": [], "requesters": []}, ""
+        if Config.ASKER_FILE:
+            try:
+                with open(Config.ASKER_FILE, encoding='utf-8') as f:
+                    text = f.read()
+            except OSError as e:
+                log.warning(f"Asker file unreadable ({type(e).__name__}): threads are not anchored this run")
+        section, prose = "profile", []
+        for line in text.splitlines():
+            if line.startswith("## "):
+                head = line[3:].strip().lower()
+                section = ("not" if head.startswith("not") else "fields" if head.startswith("field")
+                           else "requesters" if head.startswith("requester") else "other")
+            elif line.startswith("# "):
+                continue
+            elif section == "profile":
+                prose.append(line)
+            elif section in ("fields", "not", "requesters") and line.startswith("- "):
+                a[section].append(line[2:].strip())
+        a["profile"] = "\n".join(prose).strip()
+        _asker_cache = a
+    return _asker_cache
+
+
+def _asker_block() -> str:
+    """The asker's prose and fields, for a prompt; empty without an asker file."""
+    a = _asker()
+    if not a["profile"]:
+        return ""
+    fields = f"\nThe asker's fields: {'; '.join(a['fields'])}." if a["fields"] else ""
+    return f"\nWho is asking:\n{a['profile']}{fields}\n"
+
+
+def _thread_root(item: Dict, by_id: Dict) -> Optional[Dict]:
+    """The item its thread began with, following parent_id; None if a parent is missing or the chain loops."""
+    seen, cur = set(), item
+    while cur.get("parent_id"):
+        if cur.get("id") in seen:
+            return None
+        seen.add(cur.get("id"))
+        cur = by_id.get(cur["parent_id"])
+        if cur is None:
+            return None
+    return cur
+
+
+def _thread_is_mine(item: Dict, by_id: Optional[Dict] = None):
+    """(mine, root): mine when the thread began with the asker, that is, its root came from a memory scan or from a
+    requester the asker file names (for instance the name its own requests were queued under before the scan existed)."""
+    if by_id is None:
+        by_id = {q["id"]: q for q in load_queue()}
+    root = _thread_root(item, by_id)
+    return bool(root) and root.get("requester") in ("memory_scan", *_asker()["requesters"]), root
+
+
+def _spelled_out(topic: str) -> str:
+    for pat, full in _ABBREVIATIONS:
+        topic = re.sub(pat, full, topic)
+    return topic
+
+
+def asker_fit(topic: str) -> Optional[float]:
+    """The topic's best cosine to one of the asker's fields, minus its best cosine to a "Not these" line. Below 0 means
+    it sits nearer a sense of the words that isn't the asker's. None when there is no asker file, no fields or no
+    embedding model: then nothing is gated, the way the novelty check fails open.
+
+    Measured 2026-10-05 with all-mpnet-base-v2, abbreviations spelled out first. Without that, "Safety training's
+    influence on steering mechanisms in LLMs" scored 0.18 against a field about steering in language models. On 33
+    queue topics the asker labelled by hand, margin < 0 dropped 11 of the 12 that weren't the asker's, and 1 of the 12
+    that were (a person's request, which the gate never sees). On 20 older topics labelled blind before scoring, it
+    dropped 3 of the 4 that weren't the asker's and none of the 10 that were. The cutoff is 0, not a tuned number.
+    Field scores alone did worse, even with a cutoff tuned on the same 33 (3 misfiled, against 2)."""
+    a = _asker()
+    if not a["fields"]:
+        return None
+    model = _get_st_model()
+    if model is None:
+        return None
+    global _asker_emb
+    try:
+        if _asker_emb is None:
+            _asker_emb = (model.encode(a["fields"], normalize_embeddings=True),
+                          model.encode(a["not"], normalize_embeddings=True) if a["not"] else None)
+        e = model.encode(_spelled_out(topic), normalize_embeddings=True)
+        fields, nots = _asker_emb
+        return float((fields @ e).max()) - (float((nots @ e).max()) if nots is not None else 0.0)
+    except Exception as ex:
+        log.warning(f"Asker check failed (allowing the topic): {type(ex).__name__}: {ex}")
+        return None
+
+
+def _off_asker(item: Dict, by_id: Dict) -> str:
+    """Why a pending item should be skipped, or "": a topic the engine wrote, in a thread the asker began, off the
+    asker's fields. A topic a person or an agent asked for is never skipped."""
+    if item.get("requester") not in MACHINE_REQUESTERS or not _thread_is_mine(item, by_id)[0]:
+        return ""
+    fit = asker_fit(item["topic"])
+    return f"off the asker's fields, margin {fit:+.2f}" if fit is not None and fit < 0 else ""
 
 
 # ==================== MEMORY SCANNING ====================
@@ -1327,7 +1466,7 @@ def scan_memories_for_threads():
     _save_state(state)
 
     log.info("Scanning memories for unresolved research threads...")
-    stats = {"fragments": 0, "reflections": 0, "topics": 0, "rejected": 0, "queued": 0}
+    stats = {"fragments": 0, "reflections": 0, "topics": 0, "rejected": 0, "off_asker": 0, "queued": 0}
     try:
         rows = _memory_fragments_pg() if use_pg else _memory_fragments_sqlite()
         refl = _reflection_fragments()
@@ -1338,7 +1477,8 @@ def scan_memories_for_threads():
 
         # Use LLM to extract research-worthy questions; reflections take up to 4 of the 10 places
         fragments = "\n".join(f"- {row[:300]}" for row in rows[:10 - len(refl)] + refl)
-        prompt = f"""These are memory fragments from previous thinking that contain unresolved questions or threads:
+        asker = _asker_block()
+        prompt = f"""{asker.lstrip()}{chr(10) if asker else ''}These are memory fragments from previous thinking that contain unresolved questions or threads:
 
 {fragments}
 
@@ -1346,7 +1486,7 @@ Extract up to {Config.MEMORY_SCAN_LIMIT} concrete research topics from these fra
 - A specific, searchable academic query
 - Something genuinely unresolved (not already answered in the fragment)
 - Worth investigating with academic literature
-- Free of personal names, project names, places and anything private: general academic terms only
+- Free of personal names, project names, places and anything private: general academic terms only{chr(10) + '- ' + ASKER_RULE if asker else ''}
 
 Reply with JSON only, in the form {{"topics": ["...", "..."]}}. If nothing is worth pursuing, reply {{"topics": []}}."""
 
@@ -1366,6 +1506,11 @@ Reply with JSON only, in the form {{"topics": ["...", "..."]}}. If nothing is wo
                 stats["rejected"] += 1
                 log.info(f"  Memory topic rejected before any external search ({why})")
                 continue
+            fit = asker_fit(topic)
+            if fit is not None and fit < 0:
+                stats["off_asker"] += 1
+                log.info(f"  Memory topic off the asker's fields (margin {fit:+.2f}): {topic[:70]}")
+                continue
             if topic.lower() in existing or is_semantically_duplicate(topic, queue):
                 continue
             add_to_queue(topic, priority=4, requester="memory_scan")
@@ -1373,7 +1518,7 @@ Reply with JSON only, in the form {{"topics": ["...", "..."]}}. If nothing is wo
             queue = load_queue()
             stats["queued"] += 1
         log.info(f"  Memory scan: {stats['fragments']} fragments, {stats['reflections']} reflections, {stats['topics']} topics, "
-                 f"{stats['rejected']} rejected, {stats['queued']} queued")
+                 f"{stats['rejected']} rejected, {stats['off_asker']} off the asker's fields, {stats['queued']} queued")
     except Exception as e:
         log.warning(f"Memory scan failed: {type(e).__name__}: {e}")
     finally:
@@ -1412,6 +1557,29 @@ def recover_stuck(queue: List[Dict]) -> int:
     return n
 
 
+def _next_item() -> Optional[Dict]:
+    """The next pending item by priority, marked in_progress and saved. On the way, a topic the engine wrote in a
+    thread the asker began that sits off the asker's fields is marked skipped, with the reason (Nexus 2026-10-05). It
+    stays in the queue: set its status back to pending to research it anyway."""
+    queue = load_queue()
+    by_id = {q["id"]: q for q in queue}
+    skipped = 0
+    for item in sorted((i for i in queue if i["status"] == "pending"), key=lambda x: x.get("priority", 3)):
+        why = _off_asker(item, by_id)
+        if why:
+            item.update(status="skipped", skip_reason=why, skipped_at=datetime.now(timezone.utc).isoformat())
+            log.info(f"Skipped [{item['id']}] ({why}): {item['topic'][:80]}")
+            skipped += 1
+            continue
+        item["status"] = "in_progress"
+        item["started_at"] = datetime.now(timezone.utc).isoformat()
+        save_queue(queue)
+        return item
+    if skipped:
+        save_queue(queue)
+    return None
+
+
 def run_once():
     """One cron tick: take in new requests, recover the queue, then process up to ITEMS_PER_RUN items.
 
@@ -1434,14 +1602,9 @@ def run_once():
 
     done = 0
     for _ in range(max(1, Config.ITEMS_PER_RUN)):
-        queue = load_queue()
-        pending = sorted((i for i in queue if i["status"] == "pending"), key=lambda x: x.get("priority", 3))
-        if not pending:
+        item = _next_item()
+        if item is None:
             break
-        item = pending[0]
-        item["status"] = "in_progress"
-        item["started_at"] = datetime.now(timezone.utc).isoformat()
-        save_queue(queue)
         try:
             process_one(item)
             done += 1
@@ -1579,16 +1742,8 @@ def run():
             scan_memories_for_threads()
 
             # Load and process queue
-            queue = load_queue()
-            pending = [item for item in queue if item["status"] == "pending"]
-            pending.sort(key=lambda x: x.get("priority", 3))
-
-            if pending:
-                item = pending[0]
-                item["status"] = "in_progress"
-                item["started_at"] = datetime.now(timezone.utc).isoformat()
-                save_queue(queue)
-
+            item = _next_item()
+            if item:
                 try:
                     process_one(item)
                 except Exception as e:
@@ -1624,7 +1779,8 @@ if __name__ == "__main__":
             queue = load_queue()
             for item in queue:
                 status = item["status"]
-                icon = {"pending": "[.]", "in_progress": "[~]", "completed": "[x]", "failed": "[!]"}.get(status, "[?]")
+                icon = {"pending": "[.]", "in_progress": "[~]", "completed": "[x]", "failed": "[!]",
+                        "skipped": "[-]"}.get(status, "[?]")
                 print(f"  {icon} [{item['id']}] p{item['priority']} {item['topic']}")
         elif cmd == "run-once":
             run_once()

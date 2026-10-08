@@ -389,6 +389,199 @@ def test_run_once_seeds_from_memory_and_processes():
         [u() for u in undo]
 
 
+ASKER = """# Who is asking
+
+The asker is an AI agent that writes about its own memory.
+- "compaction" means its context window being summarized.
+
+## Fields
+
+- context window summarization in large language models
+- steering vectors and representation engineering in language models
+
+## Not these
+
+- event cameras, sensors and signal processing
+- industrial control systems and operational technology networks
+
+## Requesters
+
+Queue requesters that are the asker.
+- my-agent
+"""
+
+
+def set_asker(text):
+    """Point the engine at an asker file holding text (None: no file), clearing its caches."""
+    path = ''
+    if text is not None:
+        path = f'{TMP}/asker-{time.time_ns()}.md'
+        with open(path, 'w') as f:
+            f.write(text)
+    ce.Config.ASKER_FILE = path
+    ce._asker_cache = ce._asker_emb = None
+
+
+def test_asker_file_is_read_in_four_parts():
+    set_asker(ASKER)
+    try:
+        a = ce._asker()
+        assert a['profile'].startswith('The asker is an AI agent') and '"compaction" means' in a['profile'], a
+        assert a['fields'] == ['context window summarization in large language models',
+                               'steering vectors and representation engineering in language models'], a
+        assert a['not'] == ['event cameras, sensors and signal processing',
+                            'industrial control systems and operational technology networks'], a
+        assert a['requesters'] == ['my-agent'] and 'Queue requesters' not in a['profile'], a
+        set_asker(None)
+        assert ce._asker() == {'profile': '', 'fields': [], 'not': [], 'requesters': []}
+        assert ce.asker_fit('any topic at all') is None
+    finally:
+        set_asker(None)
+
+
+def test_abbreviations_are_spelled_out_before_scoring():
+    assert ce._spelled_out('Steering in LLMs and an LLM, KV caches, RL, MoE, RAG, GNNs, TTS') == \
+        ('Steering in large language models and an large language model, key-value caches, reinforcement learning, '
+         'mixture-of-experts, retrieval-augmented generation, graph neural network, text-to-speech')
+    assert ce._spelled_out('LLMSecurity and SKV stay') == 'LLMSecurity and SKV stay'
+
+
+def test_scan_prompt_carries_the_asker():
+    ce.Config.MEMORY_DB = fixture_db()
+    fake = Calls(reply='{"topics": []}')
+    undo = [patch(ce, 'ask_llm', fake.llm)]
+    try:
+        for text, want in ((ASKER, True), (None, False)):
+            set_asker(text)
+            ce._save_state({})
+            fake.calls.clear()
+            ce.scan_memories_for_threads()
+            p = fake.calls[0]
+            got = 'The asker is an AI agent' in p and 'steering vectors and representation' in p and ce.ASKER_RULE in p
+            assert got == want, p[:400]
+    finally:
+        [u() for u in undo]
+        set_asker(None)
+
+
+def test_followups_keep_the_asker_and_root_in_my_threads_only():
+    fake = Calls(reply='{"topics": []}')
+    undo = [patch(ce, 'ask_llm', fake.llm)]
+    papers = [{'source': 'arxiv', 'title': 'A paper', 'abstract': 'about something', 'year': '2025'}]
+    try:
+        set_asker(ASKER)
+        reset_queue([
+            {'id': 'r1', 'topic': 'ROOT-MINE what summarizing a context window does to an agent',
+             'requester': 'memory_scan', 'status': 'completed'},
+            {'id': 'c1', 'topic': 'a child topic of mine', 'requester': 'curiosity_engine', 'status': 'in_progress',
+             'parent_id': 'r1', 'depth': 1},
+            {'id': 'r2', 'topic': 'ROOT-THEIRS a question somebody asked', 'requester': 'user', 'status': 'completed'},
+            {'id': 'c2', 'topic': 'a child topic of theirs', 'requester': 'curiosity_engine', 'status': 'in_progress',
+             'parent_id': 'r2', 'depth': 1},
+        ])
+        q = {i['id']: i for i in ce.load_queue()}
+        ce.generate_followups(q['c1'], papers)
+        mine = fake.calls[-1]
+        assert 'Who is asking' in mine and 'ROOT-MINE' in mine and ce.ASKER_RULE in mine, mine[:600]
+        ce.generate_followups(q['c2'], papers)
+        theirs = fake.calls[-1]
+        assert 'Who is asking' not in theirs and 'ROOT-' not in theirs and ce.ASKER_RULE not in theirs, theirs[:600]
+    finally:
+        [u() for u in undo]
+        set_asker(None)
+
+
+def test_gate_skips_only_topics_the_engine_wrote_in_my_threads():
+    set_asker(ASKER)
+    off = {'off-mine', 'off-person', 'off-child-of-person', 'off-child-of-my-request'}
+    processed = []
+
+    def fake_process(item):
+        processed.append(item['id'])
+        item['status'] = 'completed'
+        return True
+    old_n = ce.Config.ITEMS_PER_RUN
+    undo = [patch(ce, 'asker_fit', lambda t: -0.3 if t in off else 0.3), patch(ce, 'process_one', fake_process),
+            patch(ce, 'scan_memories_for_threads', lambda: None)]
+    try:
+        reset_queue([
+            {'id': 'a', 'topic': 'off-mine', 'requester': 'memory_scan', 'status': 'pending', 'priority': 3},
+            {'id': 'b', 'topic': 'off-person', 'requester': 'user', 'status': 'pending', 'priority': 3},
+            {'id': 'r', 'topic': 'somebody asked this', 'requester': 'user', 'status': 'completed', 'priority': 3},
+            {'id': 'c', 'topic': 'off-child-of-person', 'requester': 'curiosity_engine', 'status': 'pending',
+             'priority': 3, 'parent_id': 'r'},
+            {'id': 'd', 'topic': 'on-mine', 'requester': 'memory_scan', 'status': 'pending', 'priority': 3},
+            {'id': 'n', 'topic': 'a question I queued myself', 'requester': 'my-agent', 'status': 'completed', 'priority': 3},
+            {'id': 'e', 'topic': 'off-child-of-my-request', 'requester': 'curiosity_engine', 'status': 'pending',
+             'priority': 3, 'parent_id': 'n'},
+        ])
+        ce.Config.ITEMS_PER_RUN = 4
+        ce.run_once()
+        q = {i['id']: i for i in ce.load_queue()}
+        assert q['a']['status'] == 'skipped' and 'margin -0.30' in q['a']['skip_reason'], q['a']
+        assert q['e']['status'] == 'skipped', q['e']
+        assert processed == ['b', 'c', 'd'], processed
+    finally:
+        [u() for u in undo]
+        ce.Config.ITEMS_PER_RUN = old_n
+        set_asker(None)
+
+
+def test_scan_gate_drops_off_asker_topics():
+    ce.Config.MEMORY_DB = fixture_db()
+    ce._save_state({})
+    reset_queue()
+    fake = Calls(reply='{"topics": ["off-field memory topic about sensors", "on-field memory topic about context windows"]}')
+    undo = [patch(ce, 'ask_llm', fake.llm), patch(ce, 'asker_fit', lambda t: -0.3 if t.startswith('off') else 0.3),
+            patch(ce, 'is_semantically_duplicate', lambda *a: False)]
+    try:
+        set_asker(ASKER)
+        ce.scan_memories_for_threads()
+        assert [i['topic'] for i in ce.load_queue()] == ['on-field memory topic about context windows'], ce.load_queue()
+        assert ce._load_state()['last_scan_stats']['off_asker'] == 1
+    finally:
+        [u() for u in undo]
+        set_asker(None)
+
+
+def test_followup_gate_drops_off_asker_topics_in_my_threads_only():
+    fake = Calls(reply='{"topics": ["off-field follow-up question here", "on-field follow-up question here"]}')
+    undo = [patch(ce, 'ask_llm', fake.llm), patch(ce, 'asker_fit', lambda t: -0.3 if t.startswith('off') else 0.3)]
+    papers = [{'source': 'arxiv', 'title': 'A paper', 'abstract': 'about something', 'year': '2025'}]
+    try:
+        set_asker(ASKER)
+        reset_queue([
+            {'id': 'r1', 'topic': 'a root of mine', 'requester': 'memory_scan', 'status': 'completed'},
+            {'id': 'c1', 'topic': 'a child of mine', 'requester': 'curiosity_engine', 'status': 'in_progress',
+             'parent_id': 'r1', 'depth': 1},
+            {'id': 'r2', 'topic': 'a root somebody asked for', 'requester': 'user', 'status': 'completed'},
+            {'id': 'c2', 'topic': 'a child of theirs', 'requester': 'curiosity_engine', 'status': 'in_progress',
+             'parent_id': 'r2', 'depth': 1},
+        ])
+        q = {i['id']: i for i in ce.load_queue()}
+        assert ce.generate_followups(q['c1'], papers) == ['on-field follow-up question here']
+        assert ce.generate_followups(q['c2'], papers) == ['off-field follow-up question here',
+                                                          'on-field follow-up question here']
+    finally:
+        [u() for u in undo]
+        set_asker(None)
+
+
+def test_asker_margin_on_real_topics():
+    """The 10-05 measurement in small. Needs the embedding model (CPU, from the local cache)."""
+    set_asker(ASKER)
+    try:
+        if ce._get_st_model() is None:
+            print('        (no embedding model: nothing measured)')
+            return
+        drift = ce.asker_fit('How does memory compaction in event cameras affect temporal resolution in high-latency '
+                             'industrial networks?')
+        mine = ce.asker_fit("Safety training's influence on steering mechanisms in LLMs")
+        assert drift < 0 < mine, (drift, mine)
+    finally:
+        set_asker(None)
+
+
 # ------------------------------------------------------------------------------------------------------------ runner
 
 if __name__ == '__main__':
