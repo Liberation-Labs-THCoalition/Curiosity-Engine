@@ -32,7 +32,8 @@ pip install psycopg2-binary sentence-transformers
 
 # Configure
 cp .env.example .env
-# Edit .env with your settings
+# Edit .env with your settings, then export it: the engine does not load .env itself
+set -a; . ./.env; set +a
 
 # Add a research topic
 python curiosity_engine.py add "transformer architecture scaling laws"
@@ -101,7 +102,8 @@ output/
 
 ## Configuration Reference
 
-All configuration is via environment variables. Set them in your shell or in a `.env` file.
+All configuration is via environment variables. Set them in your shell, or keep them in a `.env` file and export it
+before running (`set -a; . ./.env; set +a`): the engine does not load `.env` itself.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -145,7 +147,7 @@ The engine reads only its environment; it does not load a `.env` file itself. Ex
 
 | Variable | Default | Description |
 |---|---|---|
-| `CURIOSITY_LLM` | `claude` | `ollama` to use a local model |
+| `CURIOSITY_LLM` | `claude` | `ollama` to use a local model. Each item also makes one model call for its [digest](#run), so on the default Claude CLI backend that is one extra paid call per item |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
 | `CURIOSITY_OLLAMA_MODEL` | `mistral:7b` | Model name. Reasoning models (`qwen3`, `deepseek-r1`) are sent `think: false` |
 | `CURIOSITY_OLLAMA_NUM_CTX` | `2048` | Context size. Match any other program that uses the same model, or Ollama reloads it for each |
@@ -179,7 +181,13 @@ Each `run-once` takes in the idea file and the inbox, scans memory (at most ever
 57 */4 * * * cd /path/to/curiosity-engine && set -a && . ./data/local.env && set +a && python curiosity_engine.py run-once >> output/cron.log 2>&1
 ```
 
-Besides the report in `output/<date>/`, each item gets a compact `.dno` digest beside it and an entry in `output/digest/<date>.md`: the papers found, and the local model's reading of the abstracts, labelled unverified.
+Besides the report in `output/<date>/`, each item gets a compact `.dno` digest beside it and an entry in `output/digest/<date>.md`: the papers found, and the local model's reading of the abstracts, labelled unverified. The reading is one more model call per
+item, on whichever backend `CURIOSITY_LLM` selects.
+
+**PubMed currently finds almost nothing.** In one deployment's runs (32 items, 2026-10-05 to 10-07) it returned no
+results for any of them. A likely cause, not yet investigated: PubMed requires every word of the term to match, and the
+keyword queries run to 12 words. Read its silence as "not searched effectively", not as "no literature". Shorter
+PubMed-only queries are a planned follow-up.
 
 ### The asker file
 
