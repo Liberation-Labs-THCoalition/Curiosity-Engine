@@ -114,6 +114,8 @@ before running (`set -a; . ./.env; set +a`): the engine does not load `.env` its
 | `CURIOSITY_IDEAS` | *(disabled)* | Path to a markdown idea file |
 | `CURIOSITY_PID` | `./data/runner.pid` | PID file for daemon mode |
 | `DATABASE_URL` | *(disabled)* | PostgreSQL connection string for memory storage |
+| `CURIOSITY_PG_TABLE` | `memories` | Table the PostgreSQL path reads memory fragments from and writes summaries to (`schema.table` allowed; plain names only). **Was hard-coded to `lyra_memories`:** set it to keep writing there. |
+| `CURIOSITY_PG_NAMESPACE` | `curiosity_engine` | `consciousness_id` written with each summary. **Was hard-coded to `lyra_consciousness`.** |
 | `CLAUDE_CLI` | `claude` | Path to Claude CLI binary |
 | `CLAUDE_MODEL` | `haiku` | Claude model for follow-up generation |
 | `OPENALEX_EMAIL` | *(empty)* | Email for OpenAlex polite pool (faster rate limits) |
