@@ -36,6 +36,7 @@ except ImportError:
 _HAS_PSYCOPG2 = False
 try:
     import psycopg2
+    from psycopg2 import sql as pgsql
     _HAS_PSYCOPG2 = True
 except ImportError:
     pass
@@ -50,6 +51,12 @@ class Config:
     CAOGL_SOCKET = os.environ.get("CURIOSITY_INBOX", "./data/research_inbox.json")
     IDEA_FILE = os.environ.get("CURIOSITY_IDEAS", "")
     POSTGRES_URL = os.environ.get("DATABASE_URL", "")
+    # The table the PostgreSQL path reads memory fragments from and writes summaries to, and the consciousness_id it
+    # writes them under. These used to be hard-coded to `lyra_memories` and `lyra_consciousness`: a public engine
+    # shouldn't default to writing into one person's memory (Lyra, 2026-10-09). To keep the old behaviour, set
+    # CURIOSITY_PG_TABLE=lyra_memories and CURIOSITY_PG_NAMESPACE=lyra_consciousness. The table may be schema-qualified.
+    POSTGRES_TABLE = os.environ.get("CURIOSITY_PG_TABLE", "memories")
+    POSTGRES_NAMESPACE = os.environ.get("CURIOSITY_PG_NAMESPACE", "curiosity_engine")
     CLAUDE_CLI = os.environ.get("CLAUDE_CLI", "claude")
     CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "haiku")
     LLM_BACKEND = os.environ.get("CURIOSITY_LLM", "claude")  # "claude" or "ollama"
@@ -766,6 +773,18 @@ def _store_api(item: Dict, summary: str):
         log.warning(f"Memory storage failed (non-fatal): {type(e).__name__}")
 
 
+_PG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _pg_table():
+    """Config.POSTGRES_TABLE as a quoted SQL identifier (schema.table allowed). Raises ValueError on anything that
+    isn't a plain name, so a setting can never be pasted into the SQL."""
+    parts = Config.POSTGRES_TABLE.split(".")
+    if not 1 <= len(parts) <= 2 or not all(_PG_NAME.match(p) for p in parts):
+        raise ValueError(f"CURIOSITY_PG_TABLE is not a plain [schema.]table name: {Config.POSTGRES_TABLE!r}")
+    return pgsql.Identifier(*parts)
+
+
 def _store_postgres(item: Dict, summary: str):
     try:
         model = _get_st_model()
@@ -775,15 +794,15 @@ def _store_postgres(item: Dict, summary: str):
         cur = conn.cursor()
         content_hash = hashlib.sha256(summary.encode()).hexdigest()
         tags = ["auto_research", item["topic"].split()[0]]
-        cur.execute("""
-            INSERT INTO lyra_memories (content_hash, content, tags, metadata, embedding, significance, created_at, memory_type, consciousness_id)
+        cur.execute(pgsql.SQL("""
+            INSERT INTO {} (content_hash, content, tags, metadata, embedding, significance, created_at, memory_type, consciousness_id)
             VALUES (%s, %s, %s::text[], %s::jsonb, %s, %s, NOW(), %s, %s)
             ON CONFLICT (content_hash) DO NOTHING
-        """, (
+        """).format(_pg_table()), (
             content_hash, summary,
             tags,
             json.dumps({"research_id": item["id"], "requester": item["requester"]}),
-            embedding, 4, "research", "lyra_consciousness"
+            embedding, 4, "research", Config.POSTGRES_NAMESPACE
         ))
         conn.commit()
         cur.close()
@@ -1443,8 +1462,8 @@ def _memory_fragments_pg() -> List[str]:
     conn = psycopg2.connect(Config.POSTGRES_URL)
     cur = conn.cursor()
     # Find memories tagged with research-adjacent terms that might contain open questions
-    cur.execute("""
-        SELECT content FROM lyra_memories
+    cur.execute(pgsql.SQL("""
+        SELECT content FROM {}
         WHERE (
             content ILIKE '%%follow up%%'
             OR content ILIKE '%%further research%%'
@@ -1458,7 +1477,7 @@ def _memory_fragments_pg() -> List[str]:
         AND memory_type != 'research'
         ORDER BY created_at DESC
         LIMIT 20
-    """)
+    """).format(_pg_table()))
     rows = cur.fetchall()
     cur.close()
     conn.close()
